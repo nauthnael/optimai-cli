@@ -21,20 +21,18 @@ banner() {
   echo
   echo "============================================================"
   echo "  OptimAI CLI All in One - Tuangg"
-  echo "  Author: ${PROMO_NAME}"
-  echo "  ${PROMO_TEXT}"
   echo "============================================================"
   echo
 }
 
-promo_after_step() {
+# QC: chỉ hiện sau khi cài node thành công
+promo_once_after_success() {
   echo
-  echo "---- ${1} xong ✅ ----"
+  echo "✅ Cài đặt & start node thành công!"
   echo "${PROMO_TEXT}"
   echo
 }
 
-# ===== Utils =====
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 must_be_root() {
@@ -114,7 +112,6 @@ get_latest_linux_asset_url_from_github() {
   local json
   json="$(curl -fsSL "$GITHUB_RELEASE_API")"
 
-  # Parse JSON chuẩn bằng python3 nếu có
   if need_cmd python3; then
     python3 - <<'PY' "$json"
 import json, sys
@@ -134,7 +131,7 @@ best, best_s = None, -1
 for a in assets:
     name = a.get("name", "")
     url = a.get("browser_download_url", "")
-    if not url: 
+    if not url:
         continue
     s = score(name)
     if s > best_s:
@@ -148,7 +145,6 @@ PY
     return 0
   fi
 
-  # Fallback parse thô (kém chuẩn hơn)
   echo "$json" \
     | grep -oE '"browser_download_url"\s*:\s*"[^"]+"' \
     | sed -E 's/.*"([^"]+)".*/\1/' \
@@ -185,7 +181,6 @@ download_cli() {
 ensure_cli() {
   if [[ ! -x "$CLI_PATH" ]]; then
     download_cli
-    promo_after_step "Cài OptimAI CLI"
   else
     echo "[✓] OptimAI CLI đã tồn tại."
   fi
@@ -193,18 +188,51 @@ ensure_cli() {
 
 # ===== Node control =====
 start_node_in_tmux() {
+  # return codes:
+  # 0 = started new session
+  # 1 = session already exists
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "[!] tmux session '$TMUX_SESSION' đã tồn tại."
-    echo "    Xem log: tmux attach -t $TMUX_SESSION"
-    echo "    Kill session: tmux kill-session -t $TMUX_SESSION"
-    return 0
+    echo "[!] tmux session '$TMUX_SESSION' đã tồn tại (node có thể đang chạy)."
+    return 1
   fi
 
   echo "[*] Start node trong tmux session '$TMUX_SESSION'..."
   tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start"
+  return 0
 }
 
-view_logs() {
+print_log_instructions() {
+  echo
+  echo "📌 Xem log node:"
+  echo "  tmux attach -t ${TMUX_SESSION}"
+  echo
+  echo "📌 Thoát màn hình log (node vẫn chạy nền):"
+  echo "  Nhấn Ctrl + b  rồi bấm d"
+  echo
+}
+
+ask_and_maybe_open_logs() {
+  local ans
+  read -r -p "Bạn có muốn xem log không? (y/N): " ans
+  case "${ans:-}" in
+    y|Y)
+      echo
+      echo "👉 Thoát log: Ctrl + b rồi bấm d"
+      echo "📺 Mở log sau 3 giây..."
+      for i in 3 2 1; do
+        echo -ne "Mở log sau ${i}s...\r"
+        sleep 1
+      done
+      echo
+      tmux attach -t "$TMUX_SESSION"
+      ;;
+    *)
+      echo "[*] OK. Bạn có thể xem log sau bằng: tmux attach -t ${TMUX_SESSION}"
+      ;;
+  esac
+}
+
+view_logs_menu() {
   if ! need_cmd tmux; then
     echo "[!] Chưa có tmux. Hãy chạy mục (1) để auto cài tmux trước."
     return 1
@@ -216,24 +244,7 @@ view_logs() {
     return 1
   fi
 
-  echo
-  echo "📺 Mở log node..."
-  echo "👉 Thoát log: nhấn Ctrl+b rồi bấm d"
-  echo
-  tmux attach -t "$TMUX_SESSION"
-}
-
-view_logs_after_start() {
-  echo
-  echo "📌 Sẽ tự mở log sau 5 giây..."
-  echo "👉 Thoát log: nhấn Ctrl+b rồi bấm d"
-  echo
-
-  for i in 5 4 3 2 1; do
-    echo -ne "Mở log sau ${i}s...\r"
-    sleep 1
-  done
-  echo
+  print_log_instructions
   tmux attach -t "$TMUX_SESSION"
 }
 
@@ -241,21 +252,32 @@ view_logs_after_start() {
 install_first_time() {
   echo "=== (1) Cài node lần đầu ==="
   ensure_cli
-
   install_docker_if_needed
-  promo_after_step "Cài/kiểm tra Docker"
-
   install_tmux_if_needed
-  promo_after_step "Cài/kiểm tra tmux"
 
+  echo
   echo "[*] Login OptimAI (nhập email & password):"
   "$CLI_PATH" auth login
-  promo_after_step "Đăng nhập"
 
-  start_node_in_tmux
-  promo_after_step "Start node"
+  echo
+  local started=0
+  if start_node_in_tmux; then
+    started=1
+  else
+    started=0
+  fi
 
-  view_logs_after_start
+  # Chỉ coi là "cài đặt node thành công" nếu tạo được session mới
+  if [[ "$started" -eq 1 ]]; then
+    promo_once_after_success
+  else
+    echo
+    echo "[*] Node có thể đã chạy sẵn. Không hiển thị QC."
+    echo
+  fi
+
+  print_log_instructions
+  ask_and_maybe_open_logs
 }
 
 update_node() {
@@ -263,7 +285,7 @@ update_node() {
   ensure_cli
   echo "[*] Running: optimai-cli update"
   "$CLI_PATH" update
-  promo_after_step "Cập nhật node"
+  echo "[✓] Update xong."
 }
 
 check_rewards() {
@@ -271,7 +293,6 @@ check_rewards() {
   ensure_cli
   echo "[*] Running: optimai-cli rewards balance"
   "$CLI_PATH" rewards balance
-  promo_after_step "Kiểm tra rewards"
 }
 
 # ===== Menu =====
@@ -288,7 +309,7 @@ menu() {
 
   case "${choice:-}" in
     1) install_first_time ;;
-    2) view_logs ;;
+    2) view_logs_menu ;;
     3) update_node ;;
     4) check_rewards ;;
     0) exit 0 ;;
@@ -300,8 +321,3 @@ menu() {
 banner
 must_be_root
 menu
-
-echo
-echo "✅ Done!"
-echo "${PROMO_TEXT}"
-echo
