@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =======================
+# OptimAI CLI All in One - Tuangg
+# =======================
+
 CLI_PATH="/usr/local/bin/optimai-cli"
-DL_LINUX="https://github.com/OptimaiNetwork/OptimAI-CLI-Node/releases/latest/download/optimai-cli-linux"
 TMUX_SESSION="o"
 
+# Ưu tiên tải từ trang chủ, lỗi mới fallback sang GitHub release
+OFFICIAL_DL_URL="https://optimai.network/download/cli-node/linux"
+GITHUB_RELEASE_API="https://api.github.com/repos/OptimaiNetwork/OptimAI-CLI-Node/releases/latest"
+
 PROMO_NAME="Tuangg"
-PROMO_X_URL="http://x.com/tuangg"
+PROMO_X_URL="https://x.com/tuangg"
 PROMO_TEXT="Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 ${PROMO_X_URL}"
 
 # ===== UI =====
@@ -37,6 +44,18 @@ must_be_root() {
   fi
 }
 
+install_curl_if_needed() {
+  if need_cmd curl; then return; fi
+  echo "[*] Cài curl..."
+  if need_cmd apt-get; then
+    apt-get update -y
+    apt-get install -y curl
+  else
+    echo "[!] Không tìm thấy apt-get. Vui lòng tự cài curl theo distro của bạn."
+    exit 1
+  fi
+}
+
 # ===== Install deps =====
 install_tmux_if_needed() {
   if need_cmd tmux; then
@@ -44,7 +63,7 @@ install_tmux_if_needed() {
     return
   fi
   echo "[*] Cài tmux..."
-  if command -v apt-get >/dev/null 2>&1; then
+  if need_cmd apt-get; then
     apt-get update -y
     apt-get install -y tmux
   else
@@ -60,16 +79,7 @@ install_docker_if_needed() {
   fi
 
   echo "[*] Cài Docker..."
-  if ! need_cmd curl; then
-    echo "[*] Cài curl..."
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y
-      apt-get install -y curl
-    else
-      echo "[!] Không tìm thấy apt-get. Vui lòng tự cài curl."
-      exit 1
-    fi
-  fi
+  install_curl_if_needed
 
   # ĐÚNG theo lệnh bạn yêu cầu
   curl -fsSL https://get.docker.com -o get-docker.sh
@@ -87,21 +97,89 @@ install_docker_if_needed() {
   fi
 }
 
-# ===== OptimAI CLI =====
-download_cli() {
-  echo "[*] Tải OptimAI CLI..."
-  if need_cmd curl; then
-    curl -fL "$DL_LINUX" -o /tmp/optimai-cli
-  elif need_cmd wget; then
-    wget -qO /tmp/optimai-cli "$DL_LINUX"
-  else
-    echo "[!] Cần curl hoặc wget."
+# ===== OptimAI CLI download (Official -> Fallback GitHub Release) =====
+download_cli_from_official() {
+  echo "[*] Thử tải OptimAI CLI từ trang chủ..."
+  install_curl_if_needed
+  if curl -fL "$OFFICIAL_DL_URL" -o /tmp/optimai-cli; then
+    echo "[✓] Tải từ trang chủ thành công."
+    return 0
+  fi
+  echo "[!] Tải từ trang chủ thất bại (4xx/5xx hoặc network error)."
+  return 1
+}
+
+get_latest_linux_asset_url_from_github() {
+  install_curl_if_needed
+  local json
+  json="$(curl -fsSL "$GITHUB_RELEASE_API")"
+
+  # Parse JSON chuẩn bằng python3 nếu có
+  if need_cmd python3; then
+    python3 - <<'PY' "$json"
+import json, sys
+data = json.loads(sys.argv[1])
+assets = data.get("assets", [])
+
+def score(name):
+    n = name.lower()
+    s = 0
+    if "linux" in n: s += 10
+    if "amd64" in n or "x86_64" in n: s += 3
+    if "arm64" in n or "aarch64" in n: s += 2
+    if "cli" in n or "optimai" in n: s += 2
+    return s
+
+best, best_s = None, -1
+for a in assets:
+    name = a.get("name", "")
+    url = a.get("browser_download_url", "")
+    if not url: 
+        continue
+    s = score(name)
+    if s > best_s:
+        best, best_s = url, s
+
+if not best:
+    sys.exit(2)
+
+print(best)
+PY
+    return 0
+  fi
+
+  # Fallback parse thô (kém chuẩn hơn)
+  echo "$json" \
+    | grep -oE '"browser_download_url"\s*:\s*"[^"]+"' \
+    | sed -E 's/.*"([^"]+)".*/\1/' \
+    | grep -i linux \
+    | head -n 1
+}
+
+download_cli_from_github() {
+  echo "[*] Fallback: tải OptimAI CLI từ GitHub Releases..."
+  local url
+  url="$(get_latest_linux_asset_url_from_github || true)"
+
+  if [[ -z "${url:-}" ]]; then
+    echo "[!] Không lấy được asset Linux từ GitHub Releases."
     exit 1
+  fi
+
+  echo "[*] Asset URL: $url"
+  curl -fL "$url" -o /tmp/optimai-cli
+}
+
+download_cli() {
+  if download_cli_from_official; then
+    :
+  else
+    download_cli_from_github
   fi
 
   chmod +x /tmp/optimai-cli
   mv /tmp/optimai-cli "$CLI_PATH"
-  echo "[✓] Đã cài: $CLI_PATH"
+  echo "[✓] Đã cài OptimAI CLI tại: $CLI_PATH"
 }
 
 ensure_cli() {
