@@ -8,6 +8,9 @@ set -euo pipefail
 CLI_PATH="/usr/local/bin/optimai-cli"
 TMUX_SESSION="o"
 
+# Prefetch crawler image to avoid timeout on slow VPS
+CRAWLER_IMAGE="unclecode/crawl4ai:0.7.3"
+
 # Ưu tiên tải từ trang chủ, lỗi mới fallback sang GitHub release
 OFFICIAL_DL_URL="https://optimai.network/download/cli-node/linux"
 GITHUB_RELEASE_API="https://api.github.com/repos/OptimaiNetwork/OptimAI-CLI-Node/releases/latest"
@@ -25,7 +28,7 @@ banner() {
   echo
 }
 
-# QC: chỉ hiện sau khi cài node thành công
+# QC: chỉ hiện sau khi cài node thành công (tạo session tmux mới)
 promo_once_after_success() {
   echo
   echo "✅ Cài đặt & start node thành công!"
@@ -43,9 +46,9 @@ must_be_root() {
 }
 
 install_curl_if_needed() {
-  if need_cmd curl; then return; fi
+  if command -v curl >/dev/null 2>&1; then return; fi
   echo "[*] Cài curl..."
-  if need_cmd apt-get; then
+  if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
     apt-get install -y curl
   else
@@ -56,12 +59,12 @@ install_curl_if_needed() {
 
 # ===== Install deps =====
 install_tmux_if_needed() {
-  if need_cmd tmux; then
+  if command -v tmux >/dev/null 2>&1; then
     echo "[✓] tmux đã cài."
     return
   fi
   echo "[*] Cài tmux..."
-  if need_cmd apt-get; then
+  if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y
     apt-get install -y tmux
   else
@@ -71,7 +74,7 @@ install_tmux_if_needed() {
 }
 
 install_docker_if_needed() {
-  if need_cmd docker && docker info >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "[✓] Docker đã sẵn sàng."
     return
   fi
@@ -83,7 +86,7 @@ install_docker_if_needed() {
   curl -fsSL https://get.docker.com -o get-docker.sh
   sh get-docker.sh
 
-  if need_cmd systemctl; then
+  if command -v systemctl >/dev/null 2>&1; then
     systemctl enable docker >/dev/null 2>&1 || true
     systemctl start docker  >/dev/null 2>&1 || true
   fi
@@ -112,7 +115,7 @@ get_latest_linux_asset_url_from_github() {
   local json
   json="$(curl -fsSL "$GITHUB_RELEASE_API")"
 
-  if need_cmd python3; then
+  if command -v python3 >/dev/null 2>&1; then
     python3 - <<'PY' "$json"
 import json, sys
 data = json.loads(sys.argv[1])
@@ -145,11 +148,7 @@ PY
     return 0
   fi
 
-  echo "$json" \
-    | grep -oE '"browser_download_url"\s*:\s*"[^"]+"' \
-    | sed -E 's/.*"([^"]+)".*/\1/' \
-    | grep -i linux \
-    | head -n 1
+  echo "$json"     | grep -oE '"browser_download_url"\s*:\s*"[^"]+"'     | sed -E 's/.*"([^"]+)".*/\1/'     | grep -i linux     | head -n 1
 }
 
 download_cli_from_github() {
@@ -233,7 +232,7 @@ ask_and_maybe_open_logs() {
 }
 
 view_logs_menu() {
-  if ! need_cmd tmux; then
+  if ! command -v tmux >/dev/null 2>&1; then
     echo "[!] Chưa có tmux. Hãy chạy mục (1) để auto cài tmux trước."
     return 1
   fi
@@ -248,6 +247,17 @@ view_logs_menu() {
   tmux attach -t "$TMUX_SESSION"
 }
 
+prefetch_crawler_image() {
+  echo
+  echo "[*] Prefetch Docker image (để tránh timeout khi node tự pull): ${CRAWLER_IMAGE}"
+  echo "    (VPS yếu có thể kéo/giải nén lâu; nếu fail, node vẫn có thể thử pull lại sau)"
+  echo
+
+  # Theo yêu cầu: pull sẵn, fail thì vẫn tiếp tục
+  docker pull "${CRAWLER_IMAGE}" || true
+  echo
+}
+
 # ===== Menu actions =====
 install_first_time() {
   echo "=== (1) Cài node lần đầu ==="
@@ -255,7 +265,9 @@ install_first_time() {
   install_docker_if_needed
   install_tmux_if_needed
 
-  echo
+  # NEW: pre-pull image trước khi start node để giảm lỗi timeout 600s
+  prefetch_crawler_image
+
   echo "[*] Login OptimAI (nhập email & password):"
   "$CLI_PATH" auth login
 
@@ -267,7 +279,6 @@ install_first_time() {
     started=0
   fi
 
-  # Chỉ coi là "cài đặt node thành công" nếu tạo được session mới
   if [[ "$started" -eq 1 ]]; then
     promo_once_after_success
   else
