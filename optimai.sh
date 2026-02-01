@@ -224,7 +224,7 @@ prefetch_crawler_image() {
   docker pull "${CRAWLER_IMAGE}" || true
 }
 
-# ===== Watchdog (phiên bản mới nhất với debug Telegram chi tiết) =====
+# ===== Watchdog (tối ưu hiển thị log đầy đủ) =====
 start_watchdog() {
   echo
   echo "=== Bật watchdog ==="
@@ -283,6 +283,11 @@ touch "$RESTART_LOG"
 msg="<b>🟢 OptimAI Watchdog Khởi Động</b>%0A$SERVER_INFO%0AĐang bảo vệ node – chu kỳ 60 giây.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
 send_telegram "$msg"
 
+echo "============================================================"
+echo "OptimAI Watchdog đang chạy (session: $WATCHDOG_SESSION)"
+echo "Log realtime + lịch sử đầy đủ (scroll để xem cũ)"
+echo "============================================================"
+
 while true; do
   echo "------------------------------------------------------------"
   echo "$(date '+%Y-%m-%d %H:%M:%S'): === BẮT ĐẦU KIỂM TRA ==="
@@ -331,8 +336,13 @@ done
 EOF
 
   chmod +x "$WATCHDOG_SCRIPT"
+
+  # Tạo session watchdog với history buffer lớn (100000 lines) để xem log đầy đủ
   tmux new-session -d -s "$WATCHDOG_SESSION" "$WATCHDOG_SCRIPT"
-  echo "[✓] Watchdog đã bật thành công với thông báo Telegram chi tiết và debug log."
+  tmux set-option -t "$WATCHDOG_SESSION" history-limit 100000 >/dev/null 2>&1
+
+  echo "[✓] Watchdog đã bật thành công với log lịch sử đầy đủ (history-limit 100000 lines)."
+  echo "   Khi xem log (mục 7): Có thể scroll lên để xem toàn bộ lịch sử bằng PgUp/PgDn."
 }
 
 stop_watchdog() {
@@ -345,12 +355,22 @@ stop_watchdog() {
 }
 
 view_watchdog_logs() {
-  if tmux has-session -t "$WATCHDOG_SESSION" 2>/dev/null; then
-    echo "👉 Thoát log: Ctrl + b rồi d"
-    tmux attach -t "$WATCHDOG_SESSION"
-  else
-    echo "[!] Watchdog chưa chạy."
+  if ! tmux has-session -t "$WATCHDOG_SESSION" 2>/dev/null; then
+    echo "[!] Watchdog chưa chạy (không có session '$WATCHDOG_SESSION'). Hãy bật bằng mục (5)."
+    return
   fi
+
+  echo
+  echo "=== Xem log watchdog (session '$WATCHDOG_SESSION') ==="
+  echo "👉 Log realtime + lịch sử đầy đủ (đã tăng buffer lên 100000 lines)"
+  echo "👉 Để scroll xem log cũ: Nhấn Ctrl + b rồi [ (vào copy mode), dùng PgUp/PgDn hoặc mũi tên"
+  echo "👉 Thoát copy mode: Nhấn q"
+  echo "👉 Thoát tmux session: Ctrl + b rồi d (watchdog vẫn chạy nền)"
+  echo
+  echo "Đang attach session sau 3 giây..."
+  sleep 3
+
+  tmux attach -t "$WATCHDOG_SESSION"
 }
 
 configure_telegram() {
@@ -417,7 +437,7 @@ while true; do
   echo "4) Kiểm tra rewards"
   echo "5) Bật watchdog"
   echo "6) Dừng watchdog"
-  echo "7) Xem log watchdog (session '$WATCHDOG_SESSION')"
+  echo "7) Xem log watchdog (session '$WATCHDOG_SESSION' - log đầy đủ + scroll)"
   echo "8) Cấu hình Telegram"
   echo "0) Thoát"
   echo
