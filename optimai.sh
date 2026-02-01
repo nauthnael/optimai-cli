@@ -224,7 +224,7 @@ prefetch_crawler_image() {
   docker pull "${CRAWLER_IMAGE}" || true
 }
 
-# ===== Watchdog (phiên bản mới nhất với debug Telegram chi tiết) =====
+# ===== Watchdog (phiên bản cải tiến: robust hơn, debug tốt hơn) =====
 start_watchdog() {
   echo
   echo "=== Bật watchdog ==="
@@ -236,6 +236,7 @@ start_watchdog() {
 
   cat <<'EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
+set -euo pipefail
 
 TMUX_SESSION="o"
 CLI_PATH="/usr/local/bin/optimai-cli"
@@ -244,9 +245,12 @@ TELEGRAM_CONFIG="/etc/optimai/telegram.conf"
 MAX_RESTARTS=4
 WINDOW=600
 
+# Trap để log khi script die bất ngờ
+trap 'echo "$(date '+%Y-%m-%d %H:%M:%S'): ❌ Watchdog script kết thúc bất ngờ (exit code: $?)"; exit' EXIT
+
 # Load config Telegram
 if [[ -f "$TELEGRAM_CONFIG" ]]; then
-  source "$TELEGRAM_CONFIG" 2>/dev/null
+  source "$TELEGRAM_CONFIG" 2>/dev/null || echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Lỗi load config Telegram"
 fi
 
 # Server info
@@ -255,7 +259,7 @@ get_server_info() {
   local public_ip=$(curl -s --connect-timeout 5 ifconfig.me || echo "Unknown")
   echo "Server: <b>$hostname</b>%0AIP: <code>$public_ip</code>"
 }
-SERVER_INFO=$(get_server_info)
+SERVER_INFO=$(get_server_info) || echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Lỗi lấy server info"
 
 # Send Telegram với debug log
 send_telegram() {
@@ -277,11 +281,7 @@ send_telegram() {
   fi
 }
 
-touch "$RESTART_LOG"
-
-# Thông báo watchdog khởi động
-msg="<b>🟢 OptimAI Watchdog Khởi Động</b>%0A$SERVER_INFO%0AĐang bảo vệ node – chu kỳ 60 giây.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
-send_telegram "$msg"
+touch "$RESTART_LOG" || echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Lỗi touch restart log"
 
 while true; do
   echo "------------------------------------------------------------"
@@ -295,9 +295,9 @@ while true; do
 
     # Dọn log cũ an toàn
     if [[ -f "$RESTART_LOG" ]]; then
-      temp_file=$(mktemp)
-      grep -E "^[0-9]+$" "$RESTART_LOG" | awk -v c="$cutoff" '$1 > c {print}' > "$temp_file"
-      mv "$temp_file" "$RESTART_LOG"
+      temp_file=$(mktemp) || { echo "$(date '+%Y-%m-%d %H:%M:%S'): ❌ Lỗi mktemp"; continue; }
+      grep -E "^[0-9]+$" "$RESTART_LOG" 2>/dev/null | awk -v c="$cutoff" '$1 > c {print}' > "$temp_file" 2>/dev/null || echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Lỗi awk/grep dọn log"
+      mv "$temp_file" "$RESTART_LOG" 2>/dev/null || echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Lỗi mv temp file"
     fi
 
     count=$(grep -c -E "^[0-9]+$" "$RESTART_LOG" 2>/dev/null || echo 0)
@@ -306,7 +306,7 @@ while true; do
     send_telegram "$alert_msg"
 
     echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Node dừng → restart lần $((count + 1))/$MAX_RESTARTS"
-    echo "$now" >> "$RESTART_LOG"
+    echo "$now" >> "$RESTART_LOG" || echo "$(date '+%Y-%m-%d %H:%M:%S'): ⚠️ Lỗi ghi restart log"
 
     if tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start" 2>/dev/null; then
       success_msg="<b>🟢 Restart Thành Công</b>%0A$SERVER_INFO%0ANode đã chạy lại.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -325,6 +325,14 @@ while true; do
     fi
   fi
 
+  # Gửi thông báo watchdog khởi động chỉ sau kiểm tra đầu tiên thành công (xác nhận script ổn định)
+  if [[ -z "${WATCHDOG_STARTED:-}" ]]; then
+    startup_msg="<b>🟢 OptimAI Watchdog Khởi Động Thành Công</b>%0A$SERVER_INFO%0AĐang bảo vệ node ổn định – chu kỳ 60 giây.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+    send_telegram "$startup_msg"
+    export WATCHDOG_STARTED=1
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): ✅ Watchdog ổn định – đã gửi thông báo khởi động"
+  fi
+
   echo "$(date '+%Y-%m-%d %H:%M:%S'): === KẾT THÚC KIỂM TRA – ngủ 60 giây ==="
   sleep 60
 done
@@ -332,7 +340,7 @@ EOF
 
   chmod +x "$WATCHDOG_SCRIPT"
   tmux new-session -d -s "$WATCHDOG_SESSION" "$WATCHDOG_SCRIPT"
-  echo "[✓] Watchdog đã bật thành công với thông báo Telegram chi tiết và debug log."
+  echo "[✓] Watchdog đã bật thành công (phiên bản cải tiến: robust hơn, debug chi tiết, thông báo khởi động chỉ khi ổn định)."
 }
 
 stop_watchdog() {
@@ -349,7 +357,7 @@ view_watchdog_logs() {
     echo "👉 Thoát log: Ctrl + b rồi d"
     tmux attach -t "$WATCHDOG_SESSION"
   else
-    echo "[!] Watchdog chưa chạy."
+    echo "[!] Watchdog chưa chạy (không có session '$WATCHDOG_SESSION')."
   fi
 }
 
