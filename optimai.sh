@@ -3,23 +3,22 @@ set -euo pipefail
 
 # =======================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.3
+# Version: 1.1.4
 # Release date: 2026-02-01
 #
-# Fix kept from 1.1.2:
-# - Watchdog không bị exit do grep/pipeline + set -euo pipefail (dùng awk thuần, không grep)
-# - EXIT trap chỉ gửi cảnh báo khi exit code != 0 (tránh spam “die” khi exit bình thường)
-#
-# Kept optimizations:
-# ✅ Nếu count >= MAX_RESTARTS: KHÔNG restart, chỉ cảnh báo 1 lần (rate-limit) và chờ đến khi WINDOW trôi qua
-# ✅ Stop watchdog: mặc định không xóa unit, chỉ stop/disable. Uninstall tách menu riêng.
-#
-# Change in 1.1.3:
-# - Bổ sung lại quảng cáo ở câu chào tạm biệt (kèm icon)
+# Includes:
+# - Watchdog ổn định (fix triệt để grep/pipeline dưới set -euo pipefail)
+# - HARD BLOCK restart: nếu count >= MAX_RESTARTS thì không restart, chỉ cảnh báo 1 lần và chờ WINDOW trôi qua
+# - Stop watchdog: chỉ stop/disable, không xóa unit. Uninstall tách menu riêng.
+# - Hỗ trợ truyền tham số Telegram:
+#     --bot-token=... --chat-id=...
+#     --bot-token ... --chat-id ...
+#   => tự lưu /etc/optimai/telegram.conf
+# - Fix typo promo link: tuangg
 # =======================
 
 # Quảng cáo hiển thị khi thoát
-PROMO_TEXT=$'\n✨ Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 https://x.com/tuagg\n'
+PROMO_TEXT=$'\n✨ Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 https://x.com/tuangg\n'
 
 TMUX_SESSION="o"
 CLI_PATH="/usr/local/bin/optimai-cli"
@@ -30,10 +29,14 @@ WATCHDOG_SERVICE="optimai-watchdog.service"
 TELEGRAM_CONFIG="/etc/optimai/telegram.conf"
 SERVER_INFO=""
 
+# Args for Telegram
+ARG_BOT_TOKEN=""
+ARG_CHAT_ID=""
+
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.3)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.4)"
   echo "============================================================"
   echo
 }
@@ -42,6 +45,62 @@ must_be_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "[!] Vui lòng chạy script bằng root (sudo)."
     exit 1
+  fi
+}
+
+parse_deploy_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bot-token=*)
+        ARG_BOT_TOKEN="${1#*=}"
+        shift
+        ;;
+      --bot-token)
+        ARG_BOT_TOKEN="${2:-}"
+        shift 2
+        ;;
+      --chat-id=*)
+        ARG_CHAT_ID="${1#*=}"
+        shift
+        ;;
+      --chat-id)
+        ARG_CHAT_ID="${2:-}"
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'USAGE'
+Usage:
+  sudo ./optimai.sh [--bot-token=TOKEN] [--chat-id=CHAT_ID]
+
+Examples:
+  sudo ./optimai.sh --bot-token=123:ABC --chat-id=987654321
+  sudo ./optimai.sh --bot-token 123:ABC --chat-id 987654321
+USAGE
+        exit 0
+        ;;
+      *)
+        # Không nhận param này thì bỏ qua để tránh phá flow cũ
+        shift
+        ;;
+    esac
+  done
+}
+
+apply_telegram_args_if_provided() {
+  # Nếu user truyền đủ 2 tham số thì auto ghi file config
+  if [[ -n "${ARG_BOT_TOKEN:-}" && -n "${ARG_CHAT_ID:-}" ]]; then
+    mkdir -p /etc/optimai
+    cat <<EOF > "$TELEGRAM_CONFIG"
+TELEGRAM_BOT_TOKEN="$ARG_BOT_TOKEN"
+TELEGRAM_CHAT_ID="$ARG_CHAT_ID"
+EOF
+    chmod 600 "$TELEGRAM_CONFIG"
+    echo "[✓] Đã nhận tham số Telegram và lưu vào $TELEGRAM_CONFIG"
+  else
+    # Nếu chỉ truyền 1 trong 2, không ghi để tránh config nửa vời
+    if [[ -n "${ARG_BOT_TOKEN:-}" || -n "${ARG_CHAT_ID:-}" ]]; then
+      echo "[!] Bạn cần truyền đủ cả --bot-token và --chat-id để auto cấu hình Telegram."
+    fi
   fi
 }
 
@@ -402,16 +461,15 @@ check_rewards() {
   "$CLI_PATH" rewards balance
 }
 
-parse_deploy_args() { return 0; }
-
 # ===== Main =====
 parse_deploy_args "$@"
-load_telegram_config
 banner
 must_be_root
+apply_telegram_args_if_provided
+load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.3"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.4"
   echo "1) Cài đặt node lần đầu (tự động watchdog service + Telegram)"
   echo "2) Xem log node (tmux session '$TMUX_SESSION')"
   echo "3) Cập nhật node"
