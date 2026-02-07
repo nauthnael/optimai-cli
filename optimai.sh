@@ -3,10 +3,13 @@ set -euo pipefail
 
 # =======================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.4
-# Release date: 2026-02-01
+# Version: 1.1.5
+# Release date: 2026-02-07
 #
-# Includes:
+# Fix:
+# - Sửa link download optimai-cli: dùng https://optimai.network/download/cli-node/linux (ổn định, không phụ thuộc GitHub releases)
+#
+# Includes (giữ nguyên v1.1.4):
 # - Watchdog ổn định (fix triệt để grep/pipeline dưới set -euo pipefail)
 # - HARD BLOCK restart: nếu count >= MAX_RESTARTS thì không restart, chỉ cảnh báo 1 lần và chờ WINDOW trôi qua
 # - Stop watchdog: chỉ stop/disable, không xóa unit. Uninstall tách menu riêng.
@@ -17,7 +20,6 @@ set -euo pipefail
 # - Fix typo promo link: tuangg
 # =======================
 
-# Quảng cáo hiển thị khi thoát
 PROMO_TEXT=$'\n✨ Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 https://x.com/tuangg\n'
 
 TMUX_SESSION="o"
@@ -36,7 +38,7 @@ ARG_CHAT_ID=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.4)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.5)"
   echo "============================================================"
   echo
 }
@@ -79,36 +81,17 @@ USAGE
         exit 0
         ;;
       *)
-        # Không nhận param này thì bỏ qua để tránh phá flow cũ
         shift
         ;;
     esac
   done
 }
 
-apply_telegram_args_if_provided() {
-  # Nếu user truyền đủ 2 tham số thì auto ghi file config
-  if [[ -n "${ARG_BOT_TOKEN:-}" && -n "${ARG_CHAT_ID:-}" ]]; then
-    mkdir -p /etc/optimai
-    cat <<EOF > "$TELEGRAM_CONFIG"
-TELEGRAM_BOT_TOKEN="$ARG_BOT_TOKEN"
-TELEGRAM_CHAT_ID="$ARG_CHAT_ID"
-EOF
-    chmod 600 "$TELEGRAM_CONFIG"
-    echo "[✓] Đã nhận tham số Telegram và lưu vào $TELEGRAM_CONFIG"
-  else
-    # Nếu chỉ truyền 1 trong 2, không ghi để tránh config nửa vời
-    if [[ -n "${ARG_BOT_TOKEN:-}" || -n "${ARG_CHAT_ID:-}" ]]; then
-      echo "[!] Bạn cần truyền đủ cả --bot-token và --chat-id để auto cấu hình Telegram."
-    fi
-  fi
-}
-
 send_telegram() {
   local message="$1"
 
+  # shellcheck disable=SC1090
   if [[ -f "$TELEGRAM_CONFIG" ]]; then
-    # shellcheck disable=SC1090
     source "$TELEGRAM_CONFIG" 2>/dev/null || true
   fi
 
@@ -133,6 +116,17 @@ get_server_info() {
 
 load_telegram_config() {
   SERVER_INFO=$(get_server_info)
+}
+
+apply_telegram_args_if_provided() {
+  if [[ -n "$ARG_BOT_TOKEN" && -n "$ARG_CHAT_ID" ]]; then
+    mkdir -p /etc/optimai
+    cat <<EOF > "$TELEGRAM_CONFIG"
+TELEGRAM_BOT_TOKEN="$ARG_BOT_TOKEN"
+TELEGRAM_CHAT_ID="$ARG_CHAT_ID"
+EOF
+    chmod 600 "$TELEGRAM_CONFIG"
+  fi
 }
 
 install_docker_if_needed() {
@@ -180,23 +174,20 @@ ensure_cli() {
   fi
 
   echo "[*] optimai-cli chưa có. Đang tải..."
-  local api_url="https://api.github.com/repos/optimai-network/optimai-cli/releases/latest"
+  local official_url="https://optimai.network/download/cli-node/linux"
 
-  local download_url
-  download_url="$(curl -fsSL "$api_url" \
-    | grep -oE '"browser_download_url":[ ]*"[^"]+"' \
-    | cut -d'"' -f4 \
-    | grep -i linux \
-    | head -n 1 || true)"
-
-  if [[ -z "$download_url" ]]; then
-    echo "[!] Không tìm thấy bản release phù hợp (linux)."
-    exit 1
+  # -f: fail nếu HTTP != 200
+  # -L: follow redirect
+  # retry: chống mạng chập chờn
+  if curl -fL --retry 3 --retry-delay 2 --connect-timeout 10 "$official_url" -o "$CLI_PATH"; then
+    chmod +x "$CLI_PATH"
+    echo "[✓] Đã cài optimai-cli: $CLI_PATH"
+    return 0
   fi
 
-  curl -fsSL "$download_url" -o "$CLI_PATH"
-  chmod +x "$CLI_PATH"
-  echo "[✓] Đã cài optimai-cli: $CLI_PATH"
+  echo "[!] Tải optimai-cli thất bại từ: $official_url"
+  echo "[!] Kiểm tra lại mạng/VPS hoặc thử lại sau."
+  exit 1
 }
 
 start_node_in_tmux() {
@@ -263,147 +254,169 @@ fi
 
 SERVER_INFO="$(get_server_info)"
 
-# Chỉ cảnh báo die khi exit code != 0, và tránh set -e làm trap chết ngược
-trap '
-  code=$?
-  set +e
-  if [[ $code -ne 0 ]]; then
-    msg="<b>🔴 Watchdog Die Bất Ngờ</b>%0A$SERVER_INFO%0AExit code: ${code}%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")%0AVui lòng kiểm tra: journalctl -u optimai-watchdog"
-    send_telegram "$msg"
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): ❌ Watchdog die (exit code: ${code})"
+now_ts() { date +%s; }
+
+count_recent_restarts() {
+  local now
+  now="$(now_ts)"
+  if [[ ! -f "$RESTART_LOG" ]]; then
+    echo 0
+    return 0
   fi
-  exit $code
-' EXIT
 
-startup_msg="<b>🟢 OptimAI Watchdog Khởi Động Thành Công</b>%0A$SERVER_INFO%0AĐang bảo vệ node – chu kỳ 60 giây.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-send_telegram "$startup_msg"
-echo "$(date "+%Y-%m-%d %H:%M:%S"): ✅ Đã gửi thông báo khởi động"
+  local cutoff=$((now - WINDOW))
+  # tránh set -e làm chết vì grep không match
+  local count
+  count="$(awk -v c="$cutoff" '$1>=c {n++} END{print n+0}' "$RESTART_LOG" 2>/dev/null || echo 0)"
+  echo "$count"
+}
 
-touch "$RESTART_LOG" || true
+append_restart_log() {
+  local now
+  now="$(now_ts)"
+  echo "$now restart" >> "$RESTART_LOG"
+}
 
-while true; do
-  echo "$(date "+%Y-%m-%d %H:%M:%S"): === BẮT ĐẦU KIỂM TRA ==="
+is_blocked() {
+  if [[ ! -f "$BLOCK_STATE" ]]; then
+    return 1
+  fi
+  local blocked_until
+  blocked_until="$(cat "$BLOCK_STATE" 2>/dev/null || echo 0)"
+  local now
+  now="$(now_ts)"
+  if [[ "$now" -lt "$blocked_until" ]]; then
+    return 0
+  fi
+  rm -f "$BLOCK_STATE" >/dev/null 2>&1 || true
+  return 1
+}
+
+set_blocked() {
+  local now
+  now="$(now_ts)"
+  local blocked_until=$((now + WINDOW))
+  echo "$blocked_until" > "$BLOCK_STATE"
+}
+
+should_notify_block_once() {
+  # chỉ notify 1 lần mỗi lần bị block: dùng marker file
+  local marker="/tmp/optimai-block-notified.marker"
+  if [[ -f "$marker" ]]; then
+    return 1
+  fi
+  echo "1" > "$marker"
+  return 0
+}
+
+clear_block_notify_marker_if_unblocked() {
+  local marker="/tmp/optimai-block-notified.marker"
+  if [[ ! -f "$BLOCK_STATE" && -f "$marker" ]]; then
+    rm -f "$marker" >/dev/null 2>&1 || true
+  fi
+}
+
+main() {
+  clear_block_notify_marker_if_unblocked
+
+  if is_blocked; then
+    if should_notify_block_once; then
+      send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐã restart quá nhiều lần trong ${WINDOW}s. Tạm dừng restart để tránh loop.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    fi
+    echo "$(date "+%Y-%m-%d %H:%M:%S"): BLOCKED - skip restart"
+    exit 0
+  fi
 
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): ✅ Node ổn định"
-  else
-    now=$(date +%s)
-    cutoff=$((now - WINDOW))
-
-    # FIX ROOT: dùng awk thuần để tránh grep exit 1 làm chết script dưới set -e + pipefail
-    tmp="$(mktemp)" || { echo "$(date "+%Y-%m-%d %H:%M:%S"): mktemp failed"; sleep 60; continue; }
-    awk -v c="$cutoff" '($1 ~ /^[0-9]+$/) && ($1 > c) {print $1}' "$RESTART_LOG" 2>/dev/null > "$tmp" || true
-    mv "$tmp" "$RESTART_LOG" 2>/dev/null || true
-
-    count=$(awk '($1 ~ /^[0-9]+$/){n++} END{print n+0}' "$RESTART_LOG" 2>/dev/null || echo 0)
-
-    # HARD BLOCK + rate-limit + wait until WINDOW passes
-    if [[ "$count" -ge "$MAX_RESTARTS" ]]; then
-      oldest=$(head -n 1 "$RESTART_LOG" 2>/dev/null || echo "$now")
-      unblock_at=$((oldest + WINDOW))
-      wait_sec=$((unblock_at - now + 1))
-      if [[ "$wait_sec" -lt 60 ]]; then wait_sec=60; fi
-
-      last_unblock=0
-      if [[ -f "$BLOCK_STATE" ]]; then
-        last_unblock=$(cat "$BLOCK_STATE" 2>/dev/null || echo 0)
-      fi
-
-      if [[ "$last_unblock" -ne "$unblock_at" ]]; then
-        echo "$unblock_at" > "$BLOCK_STATE" 2>/dev/null || true
-        block_msg="<b>🔴 Watchdog BLOCKED – Giới Hạn Restart</b>%0A$SERVER_INFO%0AĐã đạt $MAX_RESTARTS lần trong 10 phút.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-        send_telegram "$block_msg"
-        echo "$(date "+%Y-%m-%d %H:%M:%S"): 🚫 BLOCKED ($count/$MAX_RESTARTS) - đợi $wait_sec giây"
-      else
-        echo "$(date "+%Y-%m-%d %H:%M:%S"): 🚫 BLOCKED ($count/$MAX_RESTARTS) - đã cảnh báo, đợi $wait_sec giây"
-      fi
-
-      sleep "$wait_sec"
-      continue
-    fi
-
-    alert_msg="<b>🟠 Node Dừng – Đang Restart ($((count + 1))/$MAX_RESTARTS)</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-    send_telegram "$alert_msg"
-
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): ⚠️ Restart lần $((count + 1))"
-    echo "$now" >> "$RESTART_LOG"
-
-    if tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start" 2>/dev/null; then
-      success_msg="<b>🟢 Restart Thành Công</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-      send_telegram "$success_msg"
-    else
-      fail_msg="<b>🔴 Restart Thất Bại</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-      send_telegram "$fail_msg"
-    fi
+    echo "$(date "+%Y-%m-%d %H:%M:%S"): OK - Node đang chạy"
+    exit 0
   fi
 
-  echo "$(date "+%Y-%m-%d %H:%M:%S"): === KẾT THÚC KIỂM TRA – ngủ 60 giây ==="
-  sleep 60
-done
+  local count
+  count="$(count_recent_restarts)"
+
+  if [[ "$count" -ge "$MAX_RESTARTS" ]]; then
+    set_blocked
+    send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐạt ngưỡng restart (${count}/${MAX_RESTARTS}) trong ${WINDOW}s. Tạm dừng restart.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    echo "$(date "+%Y-%m-%d %H:%M:%S"): BLOCK start - too many restarts"
+    exit 0
+  fi
+
+  echo "$(date "+%Y-%m-%d %H:%M:%S"): Node DOWN - restarting..."
+  append_restart_log
+
+  tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start" || true
+  send_telegram "<b>⚠️ Node Đã Bị Tắt - Tự Restart</b>%0A$SERVER_INFO%0ARestart count (window): ${count}/${MAX_RESTARTS}%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+}
+
+main
 EOF
 
   chmod +x "$WATCHDOG_SCRIPT"
 }
 
-create_watchdog_service() {
+create_systemd_unit() {
   cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog Service - Tuangg
-After=network.target
+Description=OptimAI Watchdog (tmux session: $TMUX_SESSION)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
 ExecStart=$WATCHDOG_SCRIPT
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
+  cat <<EOF > "/etc/systemd/system/${WATCHDOG_SERVICE}.timer"
+[Unit]
+Description=Run OptimAI Watchdog every 30 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+Unit=$WATCHDOG_SERVICE
+
+[Install]
+WantedBy=timers.target
+EOF
 }
 
 start_watchdog() {
-  echo
   echo "=== (5) Start Watchdog Service ==="
   create_watchdog_script
-  create_watchdog_service
-  systemctl enable --now "$WATCHDOG_SERVICE"
-  echo "[✓] Watchdog service đã start và enable."
-  echo "   Xem log: journalctl -u $WATCHDOG_SERVICE -f"
+  create_systemd_unit
+  systemctl daemon-reload
+  systemctl enable --now "${WATCHDOG_SERVICE}.timer"
+  echo "[✓] Watchdog đã start (timer)."
+  send_telegram "<b>🛡️ Watchdog Đã Start</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
   echo
 }
 
 stop_watchdog() {
-  echo
   echo "=== (6) Stop Watchdog Service ==="
-  systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
-  systemctl disable "$WATCHDOG_SERVICE" 2>/dev/null || true
-  echo "[✓] Watchdog service đã stop & disable (không xóa unit)."
-  echo
-}
-
-uninstall_watchdog() {
-  echo
-  echo "=== (9) Uninstall Watchdog Service (xóa unit) ==="
-  systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
-  systemctl disable "$WATCHDOG_SERVICE" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$WATCHDOG_SERVICE"
-  systemctl daemon-reload
-  echo "[✓] Đã uninstall watchdog: stop/disable + xóa file service."
+  systemctl disable --now "${WATCHDOG_SERVICE}.timer" >/dev/null 2>&1 || true
+  echo "[✓] Watchdog đã stop (timer)."
+  send_telegram "<b>🛑 Watchdog Đã Stop</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
   echo
 }
 
 status_watchdog() {
-  echo
   echo "=== (7) Status Watchdog Service ==="
-  systemctl status "$WATCHDOG_SERVICE" --no-pager
+  systemctl status "${WATCHDOG_SERVICE}.timer" --no-pager || true
   echo
-  echo "👉 Xem log: journalctl -u $WATCHDOG_SERVICE -f"
+}
+
+uninstall_watchdog() {
+  echo "=== (9) Uninstall Watchdog Service (xóa unit) ==="
+  systemctl disable --now "${WATCHDOG_SERVICE}.timer" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${WATCHDOG_SERVICE}" "/etc/systemd/system/${WATCHDOG_SERVICE}.timer" >/dev/null 2>&1 || true
+  rm -f "$WATCHDOG_SCRIPT" >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  echo "[✓] Đã gỡ watchdog service/unit."
+  send_telegram "<b>🧹 Watchdog Đã Uninstall</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
   echo
 }
 
@@ -453,13 +466,20 @@ update_node() {
   "$CLI_PATH" update
   send_telegram "<b>🔄 Node Đã Cập Nhật</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
   echo "[✓] Update xong."
+  echo
 }
 
 check_rewards() {
   echo "=== (4) Kiểm tra rewards ==="
   ensure_cli
   "$CLI_PATH" rewards balance
+  echo
 }
+
+on_exit() {
+  echo -e "$PROMO_TEXT"
+}
+trap on_exit EXIT
 
 # ===== Main =====
 parse_deploy_args "$@"
@@ -469,7 +489,7 @@ apply_telegram_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.4"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.5"
   echo "1) Cài đặt node lần đầu (tự động watchdog service + Telegram)"
   echo "2) Xem log node (tmux session '$TMUX_SESSION')"
   echo "3) Cập nhật node"
@@ -493,15 +513,7 @@ while true; do
     7) status_watchdog ;;
     8) configure_telegram ;;
     9) uninstall_watchdog ;;
-    0)
-      echo -e "Tạm biệt! 👋😄${PROMO_TEXT}"
-      exit 0
-      ;;
+    0) echo "Bye!"; exit 0 ;;
     *) echo "[!] Lựa chọn không hợp lệ." ;;
   esac
-
-  echo
-  read -r -p "Nhấn Enter để tiếp tục..."
-  clear
-  banner
 done
