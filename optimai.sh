@@ -1,24 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =======================
+# ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.5
-# Release date: 2026-02-07
+# Version: 1.1.6
 #
-# Fix:
-# - Sửa link download optimai-cli: dùng https://optimai.network/download/cli-node/linux (ổn định, không phụ thuộc GitHub releases)
+# Update theo dev OptimAI:
+# - Link tải mới nhất: https://cli-node.optimai.network/optimai_cli_ubuntu
+# - Login dùng: optimai-cli auth login --legacy
 #
-# Includes (giữ nguyên v1.1.4):
-# - Watchdog ổn định (fix triệt để grep/pipeline dưới set -euo pipefail)
-# - HARD BLOCK restart: nếu count >= MAX_RESTARTS thì không restart, chỉ cảnh báo 1 lần và chờ WINDOW trôi qua
-# - Stop watchdog: chỉ stop/disable, không xóa unit. Uninstall tách menu riêng.
-# - Hỗ trợ truyền tham số Telegram:
-#     --bot-token=... --chat-id=...
-#     --bot-token ... --chat-id ...
-#   => tự lưu /etc/optimai/telegram.conf
-# - Fix typo promo link: tuangg
-# =======================
+# Features:
+# - Cài lần đầu: tự chạy node trong tmux + bật watchdog + Telegram
+# - Xem log tmux
+# - Cập nhật node (optimai-cli update) + có menu reinstall khi update lỗi
+# - Watchdog systemd timer (30s), có BLOCK restart để tránh loop
+# ============================================================
 
 PROMO_TEXT=$'\n✨ Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 https://x.com/tuangg\n'
 
@@ -31,14 +27,17 @@ WATCHDOG_SERVICE="optimai-watchdog.service"
 TELEGRAM_CONFIG="/etc/optimai/telegram.conf"
 SERVER_INFO=""
 
-# Args for Telegram
+# Args for Telegram (optional)
 ARG_BOT_TOKEN=""
 ARG_CHAT_ID=""
+
+# Official CLI URL (updated)
+CLI_URL="https://cli-node.optimai.network/optimai_cli_ubuntu"
 
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.5)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.6)"
   echo "============================================================"
   echo
 }
@@ -90,8 +89,8 @@ USAGE
 send_telegram() {
   local message="$1"
 
-  # shellcheck disable=SC1090
   if [[ -f "$TELEGRAM_CONFIG" ]]; then
+    # shellcheck disable=SC1090
     source "$TELEGRAM_CONFIG" 2>/dev/null || true
   fi
 
@@ -115,7 +114,7 @@ get_server_info() {
 }
 
 load_telegram_config() {
-  SERVER_INFO=$(get_server_info)
+  SERVER_INFO="$(get_server_info)"
 }
 
 apply_telegram_args_if_provided() {
@@ -127,6 +126,16 @@ TELEGRAM_CHAT_ID="$ARG_CHAT_ID"
 EOF
     chmod 600 "$TELEGRAM_CONFIG"
   fi
+}
+
+install_tmux_if_needed() {
+  if command -v tmux >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[*] tmux chưa cài. Đang cài..."
+  apt-get update -y
+  apt-get install -y tmux
+  echo "[✓] tmux đã cài."
 }
 
 install_docker_if_needed() {
@@ -151,21 +160,17 @@ install_docker_if_needed() {
   echo "[✓] Docker đã cài."
 }
 
-install_tmux_if_needed() {
-  if command -v tmux >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "[*] tmux chưa cài. Đang cài..."
-  apt-get update -y
-  apt-get install -y tmux
-  echo "[✓] tmux đã cài."
-}
-
 prefetch_crawler_image() {
   if command -v docker >/dev/null 2>&1; then
     echo "[*] Prefetch image crawl4ai..."
     docker pull unclecode/crawl4ai:0.7.3 >/dev/null 2>&1 || true
   fi
+}
+
+download_cli_to_tmp() {
+  local tmp="$1"
+  echo "[*] Đang tải optimai-cli mới nhất từ: $CLI_URL"
+  curl -fL --retry 5 --retry-delay 2 --connect-timeout 10 "$CLI_URL" -o "$tmp"
 }
 
 ensure_cli() {
@@ -174,20 +179,63 @@ ensure_cli() {
   fi
 
   echo "[*] optimai-cli chưa có. Đang tải..."
-  local official_url="https://optimai.network/download/cli-node/linux"
+  local tmp="/tmp/optimai-cli.$RANDOM.$RANDOM"
 
-  # -f: fail nếu HTTP != 200
-  # -L: follow redirect
-  # retry: chống mạng chập chờn
-  if curl -fL --retry 3 --retry-delay 2 --connect-timeout 10 "$official_url" -o "$CLI_PATH"; then
-    chmod +x "$CLI_PATH"
+  if ! download_cli_to_tmp "$tmp"; then
+    echo "[!] Tải optimai-cli thất bại."
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    exit 1
+  fi
+
+  install -m 0755 "$tmp" "$CLI_PATH"
+  rm -f "$tmp" >/dev/null 2>&1 || true
+
+  if "$CLI_PATH" --help >/dev/null 2>&1; then
     echo "[✓] Đã cài optimai-cli: $CLI_PATH"
     return 0
   fi
 
-  echo "[!] Tải optimai-cli thất bại từ: $official_url"
-  echo "[!] Kiểm tra lại mạng/VPS hoặc thử lại sau."
+  echo "[!] optimai-cli không chạy được sau khi tải. Có thể sai arch hoặc thiếu thư viện."
   exit 1
+}
+
+reinstall_cli() {
+  echo "=== (10) Reinstall optimai-cli (xóa + tải lại bản mới) ==="
+
+  # stop node trong tmux để tránh đang dùng binary
+  if command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+      echo "[*] Node đang chạy trong tmux '$TMUX_SESSION' -> stop session..."
+      tmux kill-session -t "$TMUX_SESSION" || true
+      echo "[✓] Đã stop tmux session '$TMUX_SESSION'."
+    fi
+  fi
+
+  # backup bản cũ
+  if [[ -f "$CLI_PATH" ]]; then
+    local backup="${CLI_PATH}.bak.$(date +%Y%m%d-%H%M%S)"
+    echo "[*] Backup optimai-cli cũ -> $backup"
+    mv -f "$CLI_PATH" "$backup"
+  fi
+
+  local tmp="/tmp/optimai-cli.$RANDOM.$RANDOM"
+  if ! download_cli_to_tmp "$tmp"; then
+    echo "[!] Tải thất bại. Kiểm tra mạng/DNS/Firewall."
+    rm -f "$tmp" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  install -m 0755 "$tmp" "$CLI_PATH"
+  rm -f "$tmp" >/dev/null 2>&1 || true
+
+  if "$CLI_PATH" --help >/dev/null 2>&1; then
+    echo "[✓] Reinstall OK: $CLI_PATH"
+    send_telegram "<b>✅ Reinstall optimai-cli OK</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    return 0
+  else
+    echo "[!] Reinstall xong nhưng optimai-cli không chạy được."
+    return 1
+  fi
 }
 
 start_node_in_tmux() {
@@ -231,7 +279,6 @@ send_telegram() {
     echo "$(date "+%Y-%m-%d %H:%M:%S"): ⚠️ Không có config Telegram"
     return 0
   fi
-  echo "$(date "+%Y-%m-%d %H:%M:%S"): 🔄 Đang gửi Telegram"
   curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     -d chat_id="${TELEGRAM_CHAT_ID}" \
     -d text="$message" \
@@ -265,10 +312,7 @@ count_recent_restarts() {
   fi
 
   local cutoff=$((now - WINDOW))
-  # tránh set -e làm chết vì grep không match
-  local count
-  count="$(awk -v c="$cutoff" '$1>=c {n++} END{print n+0}' "$RESTART_LOG" 2>/dev/null || echo 0)"
-  echo "$count"
+  awk -v c="$cutoff" '$1>=c {n++} END{print n+0}' "$RESTART_LOG" 2>/dev/null || echo 0
 }
 
 append_restart_log() {
@@ -300,7 +344,6 @@ set_blocked() {
 }
 
 should_notify_block_once() {
-  # chỉ notify 1 lần mỗi lần bị block: dùng marker file
   local marker="/tmp/optimai-block-notified.marker"
   if [[ -f "$marker" ]]; then
     return 1
@@ -323,12 +366,10 @@ main() {
     if should_notify_block_once; then
       send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐã restart quá nhiều lần trong ${WINDOW}s. Tạm dừng restart để tránh loop.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
     fi
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): BLOCKED - skip restart"
     exit 0
   fi
 
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): OK - Node đang chạy"
     exit 0
   fi
 
@@ -338,13 +379,10 @@ main() {
   if [[ "$count" -ge "$MAX_RESTARTS" ]]; then
     set_blocked
     send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐạt ngưỡng restart (${count}/${MAX_RESTARTS}) trong ${WINDOW}s. Tạm dừng restart.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): BLOCK start - too many restarts"
     exit 0
   fi
 
-  echo "$(date "+%Y-%m-%d %H:%M:%S"): Node DOWN - restarting..."
   append_restart_log
-
   tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start" || true
   send_telegram "<b>⚠️ Node Đã Bị Tắt - Tự Restart</b>%0A$SERVER_INFO%0ARestart count (window): ${count}/${MAX_RESTARTS}%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
 }
@@ -449,7 +487,7 @@ install_first_time() {
   prefetch_crawler_image
 
   echo "[*] Login OptimAI (nhập email & password):"
-  "$CLI_PATH" auth login
+  "$CLI_PATH" auth login --legacy
 
   echo
   if start_node_in_tmux; then
@@ -463,16 +501,22 @@ install_first_time() {
 update_node() {
   echo "=== (3) Cập nhật node ==="
   ensure_cli
-  "$CLI_PATH" update
-  send_telegram "<b>🔄 Node Đã Cập Nhật</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-  echo "[✓] Update xong."
+  if "$CLI_PATH" update; then
+    send_telegram "<b>🔄 Node Đã Cập Nhật</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    echo "[✓] Update xong."
+  else
+    echo "[!] optimai-cli update bị lỗi."
+    echo "    -> Hãy chọn menu 10 để Reinstall optimai-cli (xóa + tải lại bản mới)."
+    send_telegram "<b>⚠️ optimai-cli update lỗi</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    return 1
+  fi
   echo
 }
 
 check_rewards() {
   echo "=== (4) Kiểm tra rewards ==="
   ensure_cli
-  "$CLI_PATH" rewards balance
+  "$CLI_PATH" rewards balance || true
   echo
 }
 
@@ -489,7 +533,7 @@ apply_telegram_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.5"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.6"
   echo "1) Cài đặt node lần đầu (tự động watchdog service + Telegram)"
   echo "2) Xem log node (tmux session '$TMUX_SESSION')"
   echo "3) Cập nhật node"
@@ -499,9 +543,10 @@ while true; do
   echo "7) Status Watchdog Service"
   echo "8) Cấu hình Telegram"
   echo "9) Uninstall Watchdog Service (xóa unit)"
+  echo "10) Reinstall optimai-cli (xóa + tải lại bản mới)"
   echo "0) Thoát"
   echo
-  read -r -p "Chọn [0-9]: " choice
+  read -r -p "Chọn [0-10]: " choice
 
   case "$choice" in
     1) install_first_time ;;
@@ -513,6 +558,7 @@ while true; do
     7) status_watchdog ;;
     8) configure_telegram ;;
     9) uninstall_watchdog ;;
+    10) reinstall_cli ;;
     0) echo "Bye!"; exit 0 ;;
     *) echo "[!] Lựa chọn không hợp lệ." ;;
   esac
