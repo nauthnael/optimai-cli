@@ -3,9 +3,16 @@ set -euo pipefail
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.7
+# Version: 1.1.8
 #
 # Updates:
+# v1.1.8:
+# - Fix watchdog: bỏ set -euo pipefail tránh exit bất ngờ khi check/restart
+# - Fix node_running(): strip ANSI codes, trim whitespace trước khi grep
+# - Tăng verify sleep 3->8s + retry 3 lần khi check node status sau restart
+# - Fix append_restart_log: chỉ tăng count khi restart thực sự thất bại
+# - Fix restart_node(): không dùng `if !` với set -e, dùng biến exit code
+# v1.1.7:
 # - Fix start node in tmux: dùng đúng câu lệnh đã test OK:
 #     tmux new-session -d -s o "bash -lc '/usr/local/bin/optimai-cli node start'"
 # - Watchdog check node live theo: optimai-cli node status (Node running / Node not running)
@@ -34,7 +41,7 @@ ARG_CHAT_ID=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.7)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.8)"
   echo "============================================================"
   echo
 }
@@ -284,7 +291,8 @@ view_logs_menu() {
 create_watchdog_script() {
   cat <<'EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-set -euo pipefail
+# KHÔNG dùng set -euo pipefail ở đây để tránh exit bất ngờ khi check status
+# Mỗi lệnh quan trọng sẽ được xử lý lỗi thủ công
 
 TMUX_SESSION="o"
 CLI_PATH="/usr/local/bin/optimai-cli"
@@ -376,9 +384,11 @@ node_status_text() {
 }
 
 node_running() {
-  local out
+  local out clean
   out="$(node_status_text)"
-  echo "$out" | grep -qiE '^Node running'
+  # Strip ANSI color codes và trim whitespace trước khi grep
+  clean="$(echo "$out" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^[[:space:]]*//')"
+  echo "$clean" | grep -qiE '^Node running'
 }
 
 tmux_session_exists() {
@@ -392,26 +402,40 @@ restart_node() {
   if tmux_session_exists; then
     log "Killing tmux session '$TMUX_SESSION'"
     tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
+    sleep 1
   fi
 
   log "Starting node in tmux '$TMUX_SESSION'..."
-  # QUAN TRỌNG: start bằng bash -lc (đúng cách đã test OK)
-  if ! tmux new-session -d -s "$TMUX_SESSION" "bash -lc '$CLI_PATH node start'"; then
-    log "ERROR: tmux new-session failed"
-    send_telegram "<b>❌ Watchdog restart FAIL</b>%0A$SERVER_INFO%0Atmux new-session failed%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+  # Dùng biến exit code thay vì `if !` để tương thích với môi trường không có set -e
+  tmux new-session -d -s "$TMUX_SESSION" "bash -lc '$CLI_PATH node start'"
+  local tmux_exit=$?
+
+  if [[ $tmux_exit -ne 0 ]]; then
+    log "ERROR: tmux new-session failed (exit $tmux_exit)"
+    send_telegram "<b>❌ Watchdog restart FAIL</b>%0A$SERVER_INFO%0Atmux new-session failed (exit $tmux_exit)%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     return 1
   fi
 
-  # verify lại bằng node status
-  sleep 3
+  # Chờ lâu hơn (8s) để node có thời gian khởi động, retry 3 lần
+  local retries=3
+  local wait_sec=8
+  local attempt=0
   local st
-  st="$(node_status_text)"
-  if echo "$st" | grep -qiE '^Node running'; then
-    log "Restart OK. Status: $st"
-    return 0
-  fi
 
-  log "ERROR: Restart attempted but node still NOT running. Status: $st"
+  while [[ $attempt -lt $retries ]]; do
+    sleep "$wait_sec"
+    st="$(node_status_text)"
+    local clean
+    clean="$(echo "$st" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/^[[:space:]]*//')"
+    if echo "$clean" | grep -qiE '^Node running'; then
+      log "Restart OK (attempt $((attempt+1))). Status: $st"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    log "Verify attempt $attempt/$retries: node chưa running. Status: $st"
+  done
+
+  log "ERROR: Restart attempted but node still NOT running after ${retries} retries. Status: $st"
   send_telegram "<b>❌ Watchdog restart FAIL</b>%0A$SERVER_INFO%0AStatus sau restart: <code>$(echo "$st" | head -n 2 | tr '\n' ' ')</code>%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   return 1
 }
@@ -443,15 +467,18 @@ main() {
     exit 0
   fi
 
-  append_restart_log
-
   local st
   st="$(node_status_text)"
   log "Node DOWN. Status: $st"
 
-  restart_node || exit 0
+  # Ghi log restart TRƯỚC khi thực hiện để đúng count window
+  append_restart_log
 
-  send_telegram "<b>⚠️ Node DOWN - Tự Restart</b>%0A$SERVER_INFO%0ARestart count (window): ${count}/${MAX_RESTARTS}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+  if restart_node; then
+    send_telegram "<b>⚠️ Node DOWN - Tự Restart</b>%0A$SERVER_INFO%0ARestart count (window): $((count+1))/${MAX_RESTARTS}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+  # Dù restart thành công hay thất bại đều exit 0 để systemd không retry liên tục
+  exit 0
 }
 
 main
@@ -600,7 +627,7 @@ apply_telegram_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.7"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.8"
   echo "1) Cài đặt node lần đầu (tự động watchdog service + Telegram)"
   echo "2) Xem log node (tmux session '$TMUX_SESSION')"
   echo "3) Cập nhật node"
