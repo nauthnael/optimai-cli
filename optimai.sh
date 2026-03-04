@@ -3,9 +3,14 @@ set -euo pipefail
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.10
+# Version: 1.1.11
 #
 # Updates:
+# v1.1.11:
+#   - Thêm auto_login(): dùng expect để tự nhập email/password
+#   - Hỗ trợ tham số --email= và --password= để login không cần nhập tay
+#   - Menu option 11: Re-login node (dùng khi session hết hạn sau 1 tuần)
+#   - install_first_time() tự dùng auto_login nếu có --email/--password
 # v1.1.10:
 #   - Watchdog viết lại dựa trên kiến trúc ổn định của v1.1.4:
 #     + Type=simple + while true (không dùng oneshot+timer)
@@ -45,6 +50,8 @@ SERVER_INFO=""
 
 ARG_BOT_TOKEN=""
 ARG_CHAT_ID=""
+ARG_EMAIL=""
+ARG_PASSWORD=""
 
 # ============================================================
 # BANNER & UTILS
@@ -53,7 +60,7 @@ ARG_CHAT_ID=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.10)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.11)"
   echo "============================================================"
   echo
 }
@@ -68,6 +75,10 @@ must_be_root() {
 parse_deploy_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --email=*)     ARG_EMAIL="${1#*=}";    shift ;;
+      --email)       ARG_EMAIL="${2:-}";     shift 2 ;;
+      --password=*)  ARG_PASSWORD="${1#*=}"; shift ;;
+      --password)    ARG_PASSWORD="${2:-}";  shift 2 ;;
       --bot-token=*) ARG_BOT_TOKEN="${1#*=}"; shift ;;
       --bot-token)   ARG_BOT_TOKEN="${2:-}";  shift 2 ;;
       --chat-id=*)   ARG_CHAT_ID="${1#*=}";   shift ;;
@@ -75,11 +86,17 @@ parse_deploy_args() {
       -h|--help)
         cat <<'USAGE'
 Usage:
-  sudo ./optimai.sh [--bot-token=TOKEN] [--chat-id=CHAT_ID]
+  sudo ./optimai.sh [OPTIONS]
+
+Options:
+  --email=EMAIL          Email OptimAI (dùng cho auto-login)
+  --password=PASSWORD    Password OptimAI (dùng cho auto-login)
+  --bot-token=TOKEN      Telegram bot token
+  --chat-id=CHAT_ID      Telegram chat ID
 
 Examples:
-  sudo ./optimai.sh --bot-token=123:ABC --chat-id=987654321
-  sudo ./optimai.sh --bot-token 123:ABC --chat-id 987654321
+  sudo ./optimai.sh --email=you@mail.com --password=yourpass
+  sudo ./optimai.sh --email=you@mail.com --password=yourpass --bot-token=123:ABC --chat-id=987654321
 USAGE
         exit 0 ;;
       *) shift ;;
@@ -568,6 +585,114 @@ EOF
 }
 
 # ============================================================
+# AUTO LOGIN (v1.1.11)
+# Dùng expect để tự động nhập email + password vào CLI
+# ============================================================
+
+install_expect_if_needed() {
+  if command -v expect >/dev/null 2>&1; then return 0; fi
+  echo "[*] Cài expect..."
+  apt-get install -y expect -qq >/dev/null 2>&1
+  echo "[✓] expect đã cài."
+}
+
+auto_login() {
+  local email="$1"
+  local password="$2"
+
+  install_expect_if_needed
+
+  echo "[*] Auto login: $email"
+
+  local output
+  output=$(expect -c "
+    log_user 1
+    set timeout 30
+    spawn ${CLI_PATH} auth login --legacy
+    expect {
+      -re {(?i)(email|e-mail|username)} {
+        send \"${email}\r\"
+        exp_continue
+      }
+      -re {(?i)(password|pass)} {
+        send \"${password}\r\"
+        exp_continue
+      }
+      -re {(?i)(success|logged in|welcome|done|✓|ok)} {}
+      timeout {
+        puts \"\\nERROR: Login timeout - CLI không hiện prompt\"
+        exit 1
+      }
+      eof {}
+    }
+  " 2>&1)
+  local rc=$?
+
+  echo "$output"
+
+  if [[ $rc -ne 0 ]]; then
+    echo "[!] Auto login thất bại (exit $rc)."
+    return 1
+  fi
+
+  # Kiểm tra output có dấu hiệu thành công không
+  if echo "$output" | grep -qiE "(error|invalid|incorrect|failed|wrong)"; then
+    echo "[!] Login có thể thất bại — kiểm tra email/password."
+    return 1
+  fi
+
+  echo "[✓] Login thành công."
+  return 0
+}
+
+relogin_node() {
+  echo "=== (11) Re-login node ==="
+  ensure_cli
+
+  local email="$ARG_EMAIL"
+  local password="$ARG_PASSWORD"
+
+  # Nếu không có tham số CLI thì hỏi tay
+  if [[ -z "$email" ]]; then
+    read -r -p "Email OptimAI: " email
+  fi
+  if [[ -z "$password" ]]; then
+    read -r -s -p "Password OptimAI: " password
+    echo
+  fi
+
+  if [[ -z "$email" || -z "$password" ]]; then
+    echo "[!] Email và password không được để trống."
+    return 1
+  fi
+
+  # Stop watchdog tạm để tránh race condition
+  echo "[*] Tạm stop watchdog trong khi login..."
+  systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
+
+  if auto_login "$email" "$password"; then
+    echo
+    echo "[*] Restart node sau khi login..."
+    if start_node_in_tmux; then
+      send_telegram "<b>🔑 Re-login & Restart Thành Công</b>%0A${SERVER_INFO}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo "[✓] Node đã chạy lại."
+    else
+      echo "[!] Node start thất bại sau login."
+      send_telegram "<b>⚠️ Re-login OK nhưng Node Start Lỗi</b>%0A${SERVER_INFO}%0AChạy: tmux attach -t ${TMUX_SESSION}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+    fi
+  else
+    echo "[!] Login thất bại. Node giữ nguyên trạng thái."
+    send_telegram "<b>❌ Re-login Thất Bại</b>%0A${SERVER_INFO}%0AKiểm tra email/password.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+
+  # Khởi động lại watchdog
+  echo "[*] Khởi động lại watchdog..."
+  systemctl start "$WATCHDOG_SERVICE" 2>/dev/null || true
+
+  echo
+}
+
+# ============================================================
 # FIRST INSTALL
 # ============================================================
 
@@ -578,8 +703,17 @@ install_first_time() {
   install_tmux_if_needed
   prefetch_crawler_image
 
-  echo "[*] Login OptimAI (nhập email & password):"
-  "$CLI_PATH" auth login --legacy
+  # Dùng auto_login nếu có --email/--password, ngược lại nhập tay
+  if [[ -n "$ARG_EMAIL" && -n "$ARG_PASSWORD" ]]; then
+    echo "[*] Dùng auto login từ tham số dòng lệnh..."
+    if ! auto_login "$ARG_EMAIL" "$ARG_PASSWORD"; then
+      echo "[!] Auto login thất bại. Chuyển sang nhập tay:"
+      "$CLI_PATH" auth login --legacy
+    fi
+  else
+    echo "[*] Login OptimAI (nhập email & password):"
+    "$CLI_PATH" auth login --legacy
+  fi
 
   echo
   if start_node_in_tmux; then
@@ -607,7 +741,7 @@ apply_telegram_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.10"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.11"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -618,9 +752,10 @@ while true; do
   echo "8)  Cấu hình Telegram"
   echo "9)  Uninstall Watchdog Service"
   echo "10) Reinstall optimai-cli (xóa + tải lại bản mới)"
+  echo "11) Re-login node (khi session hết hạn)"
   echo "0)  Thoát"
   echo
-  read -r -p "Chọn [0-10]: " choice
+  read -r -p "Chọn [0-11]: " choice
 
   case "$choice" in
     1)  install_first_time ;;
@@ -633,6 +768,7 @@ while true; do
     8)  configure_telegram ;;
     9)  uninstall_watchdog ;;
     10) reinstall_cli ;;
+    11) relogin_node ;;
     0)
       echo "Bye! 👋"
       exit 0
