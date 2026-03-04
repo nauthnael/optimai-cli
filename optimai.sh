@@ -3,23 +3,24 @@ set -euo pipefail
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.6
+# Version: 1.1.7
 #
-# Update theo dev OptimAI:
-# - Link tải mới nhất: https://cli-node.optimai.network/optimai_cli_ubuntu
-# - Login dùng: optimai-cli auth login --legacy
+# Updates:
+# - Fix start node in tmux: dùng đúng câu lệnh đã test OK:
+#     tmux new-session -d -s o "bash -lc '/usr/local/bin/optimai-cli node start'"
+# - Watchdog check node live theo: optimai-cli node status (Node running / Node not running)
+# - Watchdog restart cũng start node bằng bash -lc + verify lại status
 #
-# Features:
-# - Cài lần đầu: tự chạy node trong tmux + bật watchdog + Telegram
-# - Xem log tmux
-# - Cập nhật node (optimai-cli update) + có menu reinstall khi update lỗi
-# - Watchdog systemd timer (30s), có BLOCK restart để tránh loop
+# Dev info:
+# - Link tải CLI mới nhất: https://cli-node.optimai.network/optimai_cli_ubuntu
+# - Login: optimai-cli auth login --legacy
 # ============================================================
 
 PROMO_TEXT=$'\n✨ Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 https://x.com/tuangg\n'
 
 TMUX_SESSION="o"
 CLI_PATH="/usr/local/bin/optimai-cli"
+CLI_URL="https://cli-node.optimai.network/optimai_cli_ubuntu"
 
 WATCHDOG_SCRIPT="/usr/local/bin/optimai-watchdog"
 WATCHDOG_SERVICE="optimai-watchdog.service"
@@ -27,17 +28,13 @@ WATCHDOG_SERVICE="optimai-watchdog.service"
 TELEGRAM_CONFIG="/etc/optimai/telegram.conf"
 SERVER_INFO=""
 
-# Args for Telegram (optional)
 ARG_BOT_TOKEN=""
 ARG_CHAT_ID=""
-
-# Official CLI URL (updated)
-CLI_URL="https://cli-node.optimai.network/optimai_cli_ubuntu"
 
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.6)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.7)"
   echo "============================================================"
   echo
 }
@@ -106,11 +103,10 @@ send_telegram() {
 }
 
 get_server_info() {
-  local hostname
+  local hostname ip
   hostname=$(hostname 2>/dev/null || echo "Unknown")
-  local public_ip
-  public_ip=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "Unknown")
-  echo "Server: <b>$hostname</b>%0AIP: <code>$public_ip</code>"
+  ip=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "Unknown")
+  echo "Server: <b>$hostname</b>%0AIP: <code>$ip</code>"
 }
 
 load_telegram_config() {
@@ -230,7 +226,7 @@ reinstall_cli() {
 
   if "$CLI_PATH" --help >/dev/null 2>&1; then
     echo "[✓] Reinstall OK: $CLI_PATH"
-    send_telegram "<b>✅ Reinstall optimai-cli OK</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    send_telegram "<b>✅ Reinstall optimai-cli OK</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     return 0
   else
     echo "[!] Reinstall xong nhưng optimai-cli không chạy được."
@@ -238,15 +234,40 @@ reinstall_cli() {
   fi
 }
 
+# ===== FIX START NODE (v1.1.7) =====
 start_node_in_tmux() {
+  install_tmux_if_needed
+
+  # nếu session tồn tại -> kill để start lại cho sạch
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "[!] Node đang chạy trong tmux session '$TMUX_SESSION'."
-    return 1
+    echo "[*] tmux session '$TMUX_SESSION' đã tồn tại -> kill để start lại."
+    tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
   fi
+
   echo "[*] Đang start node trong tmux session '$TMUX_SESSION'..."
-  tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start"
-  echo "[✓] Node đã chạy. Dùng: tmux attach -t $TMUX_SESSION"
-  return 0
+  # Dùng đúng câu lệnh bạn xác nhận OK
+  tmux new-session -d -s "$TMUX_SESSION" "bash -lc '$CLI_PATH node start'"
+
+  # verify nhanh
+  sleep 3
+  local st
+  st="$("$CLI_PATH" node status 2>&1 || true)"
+
+  if echo "$st" | grep -qiE '^Node running'; then
+    echo "[✓] Node đã chạy OK: $st"
+    echo "    Xem log: tmux attach -t $TMUX_SESSION"
+    return 0
+  fi
+
+  echo "[!] Start xong nhưng node chưa chạy."
+  echo "    Status: $st"
+  echo
+  echo "[*] 50 dòng log tmux gần nhất:"
+  tmux capture-pane -t "${TMUX_SESSION}:0.0" -p -S -50 2>/dev/null || true
+  echo
+  echo "[*] Thử xem trực tiếp:"
+  echo "    tmux attach -t $TMUX_SESSION"
+  return 1
 }
 
 view_logs_menu() {
@@ -267,16 +288,22 @@ set -euo pipefail
 
 TMUX_SESSION="o"
 CLI_PATH="/usr/local/bin/optimai-cli"
+
 RESTART_LOG="/tmp/optimai-restarts.log"
 BLOCK_STATE="/tmp/optimai-blocked.state"
+MARKER="/tmp/optimai-block-notified.marker"
+ERR_LOG="/tmp/optimai-watchdog.err"
+
 TELEGRAM_CONFIG="/etc/optimai/telegram.conf"
+
 MAX_RESTARTS=4
 WINDOW=600
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" >> "$ERR_LOG"; }
 
 send_telegram() {
   local message="$1"
   if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-    echo "$(date "+%Y-%m-%d %H:%M:%S"): ⚠️ Không có config Telegram"
     return 0
   fi
   curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -287,31 +314,25 @@ send_telegram() {
 }
 
 get_server_info() {
-  local hostname
+  local hostname ip
   hostname=$(hostname 2>/dev/null || echo "Unknown")
-  local public_ip
-  public_ip=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "Unknown")
-  echo "Server: <b>$hostname</b>%0AIP: <code>$public_ip</code>"
+  ip=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo "Unknown")
+  echo "Server: <b>$hostname</b>%0AIP: <code>$ip</code>"
 }
 
 if [[ -f "$TELEGRAM_CONFIG" ]]; then
   # shellcheck disable=SC1090
   source "$TELEGRAM_CONFIG" 2>/dev/null || true
 fi
-
 SERVER_INFO="$(get_server_info)"
 
 now_ts() { date +%s; }
 
 count_recent_restarts() {
-  local now
+  local now cutoff
   now="$(now_ts)"
-  if [[ ! -f "$RESTART_LOG" ]]; then
-    echo 0
-    return 0
-  fi
-
-  local cutoff=$((now - WINDOW))
+  cutoff=$((now - WINDOW))
+  [[ -f "$RESTART_LOG" ]] || { echo 0; return; }
   awk -v c="$cutoff" '$1>=c {n++} END{print n+0}' "$RESTART_LOG" 2>/dev/null || echo 0
 }
 
@@ -322,14 +343,11 @@ append_restart_log() {
 }
 
 is_blocked() {
-  if [[ ! -f "$BLOCK_STATE" ]]; then
-    return 1
-  fi
-  local blocked_until
-  blocked_until="$(cat "$BLOCK_STATE" 2>/dev/null || echo 0)"
-  local now
+  [[ -f "$BLOCK_STATE" ]] || return 1
+  local until now
+  until="$(cat "$BLOCK_STATE" 2>/dev/null || echo 0)"
   now="$(now_ts)"
-  if [[ "$now" -lt "$blocked_until" ]]; then
+  if [[ "$now" -lt "$until" ]]; then
     return 0
   fi
   rm -f "$BLOCK_STATE" >/dev/null 2>&1 || true
@@ -339,37 +357,79 @@ is_blocked() {
 set_blocked() {
   local now
   now="$(now_ts)"
-  local blocked_until=$((now + WINDOW))
-  echo "$blocked_until" > "$BLOCK_STATE"
+  echo $((now + WINDOW)) > "$BLOCK_STATE"
 }
 
-should_notify_block_once() {
-  local marker="/tmp/optimai-block-notified.marker"
-  if [[ -f "$marker" ]]; then
+notify_block_once() {
+  [[ -f "$MARKER" ]] && return 0
+  echo 1 > "$MARKER"
+  send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐã restart quá nhiều lần trong ${WINDOW}s. Tạm dừng restart để tránh loop.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+clear_block_marker_if_needed() {
+  [[ -f "$BLOCK_STATE" ]] && return 0
+  [[ -f "$MARKER" ]] && rm -f "$MARKER" >/dev/null 2>&1 || true
+}
+
+node_status_text() {
+  "$CLI_PATH" node status 2>&1 || true
+}
+
+node_running() {
+  local out
+  out="$(node_status_text)"
+  echo "$out" | grep -qiE '^Node running'
+}
+
+tmux_session_exists() {
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+}
+
+restart_node() {
+  log "Restart requested..."
+
+  # kill tmux session nếu có (kể cả zombie)
+  if tmux_session_exists; then
+    log "Killing tmux session '$TMUX_SESSION'"
+    tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
+  fi
+
+  log "Starting node in tmux '$TMUX_SESSION'..."
+  # QUAN TRỌNG: start bằng bash -lc (đúng cách đã test OK)
+  if ! tmux new-session -d -s "$TMUX_SESSION" "bash -lc '$CLI_PATH node start'"; then
+    log "ERROR: tmux new-session failed"
+    send_telegram "<b>❌ Watchdog restart FAIL</b>%0A$SERVER_INFO%0Atmux new-session failed%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     return 1
   fi
-  echo "1" > "$marker"
-  return 0
-}
 
-clear_block_notify_marker_if_unblocked() {
-  local marker="/tmp/optimai-block-notified.marker"
-  if [[ ! -f "$BLOCK_STATE" && -f "$marker" ]]; then
-    rm -f "$marker" >/dev/null 2>&1 || true
+  # verify lại bằng node status
+  sleep 3
+  local st
+  st="$(node_status_text)"
+  if echo "$st" | grep -qiE '^Node running'; then
+    log "Restart OK. Status: $st"
+    return 0
   fi
+
+  log "ERROR: Restart attempted but node still NOT running. Status: $st"
+  send_telegram "<b>❌ Watchdog restart FAIL</b>%0A$SERVER_INFO%0AStatus sau restart: <code>$(echo "$st" | head -n 2 | tr '\n' ' ')</code>%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+  return 1
 }
 
 main() {
-  clear_block_notify_marker_if_unblocked
+  clear_block_marker_if_needed
+
+  command -v tmux >/dev/null 2>&1 || { log "tmux not found"; exit 0; }
+  [[ -x "$CLI_PATH" ]] || { log "optimai-cli missing or not executable"; exit 0; }
 
   if is_blocked; then
-    if should_notify_block_once; then
-      send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐã restart quá nhiều lần trong ${WINDOW}s. Tạm dừng restart để tránh loop.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
-    fi
+    log "BLOCKED - skip restart"
+    notify_block_once
     exit 0
   fi
 
-  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  if node_running; then
+    log "OK - node is running"
     exit 0
   fi
 
@@ -378,13 +438,20 @@ main() {
 
   if [[ "$count" -ge "$MAX_RESTARTS" ]]; then
     set_blocked
-    send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐạt ngưỡng restart (${count}/${MAX_RESTARTS}) trong ${WINDOW}s. Tạm dừng restart.%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    log "too many restarts (${count}/${MAX_RESTARTS}) -> BLOCK"
+    send_telegram "<b>⛔ Watchdog BLOCK Restart</b>%0A$SERVER_INFO%0AĐạt ngưỡng restart (${count}/${MAX_RESTARTS}) trong ${WINDOW}s. Tạm dừng restart.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     exit 0
   fi
 
   append_restart_log
-  tmux new-session -d -s "$TMUX_SESSION" "$CLI_PATH node start" || true
-  send_telegram "<b>⚠️ Node Đã Bị Tắt - Tự Restart</b>%0A$SERVER_INFO%0ARestart count (window): ${count}/${MAX_RESTARTS}%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+
+  local st
+  st="$(node_status_text)"
+  log "Node DOWN. Status: $st"
+
+  restart_node || exit 0
+
+  send_telegram "<b>⚠️ Node DOWN - Tự Restart</b>%0A$SERVER_INFO%0ARestart count (window): ${count}/${MAX_RESTARTS}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
 }
 
 main
@@ -429,7 +496,7 @@ start_watchdog() {
   systemctl daemon-reload
   systemctl enable --now "${WATCHDOG_SERVICE}.timer"
   echo "[✓] Watchdog đã start (timer)."
-  send_telegram "<b>🛡️ Watchdog Đã Start</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+  send_telegram "<b>🛡️ Watchdog Đã Start</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
 }
 
@@ -437,7 +504,7 @@ stop_watchdog() {
   echo "=== (6) Stop Watchdog Service ==="
   systemctl disable --now "${WATCHDOG_SERVICE}.timer" >/dev/null 2>&1 || true
   echo "[✓] Watchdog đã stop (timer)."
-  send_telegram "<b>🛑 Watchdog Đã Stop</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+  send_telegram "<b>🛑 Watchdog Đã Stop</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
 }
 
@@ -454,7 +521,7 @@ uninstall_watchdog() {
   rm -f "$WATCHDOG_SCRIPT" >/dev/null 2>&1 || true
   systemctl daemon-reload
   echo "[✓] Đã gỡ watchdog service/unit."
-  send_telegram "<b>🧹 Watchdog Đã Uninstall</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+  send_telegram "<b>🧹 Watchdog Đã Uninstall</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
 }
 
@@ -474,7 +541,7 @@ TELEGRAM_CHAT_ID="$chat_id"
 EOF
   chmod 600 "$TELEGRAM_CONFIG"
   load_telegram_config
-  send_telegram "<b>✅ Cấu Hình Telegram Thành Công</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+  send_telegram "<b>✅ Cấu Hình Telegram Thành Công</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "[✓] Đã lưu & gửi test message."
   echo
 }
@@ -491,10 +558,10 @@ install_first_time() {
 
   echo
   if start_node_in_tmux; then
-    send_telegram "<b>🟢 Node Cài Đặt & Khởi Động Thành Công</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    send_telegram "<b>🟢 Node Cài Đặt & Khởi Động Thành Công</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     start_watchdog
   else
-    echo "[*] Node có thể đã chạy sẵn."
+    echo "[!] Start node thất bại. Xem log tmux ở trên."
   fi
 }
 
@@ -502,12 +569,12 @@ update_node() {
   echo "=== (3) Cập nhật node ==="
   ensure_cli
   if "$CLI_PATH" update; then
-    send_telegram "<b>🔄 Node Đã Cập Nhật</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    send_telegram "<b>🔄 Node Đã Cập Nhật</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "[✓] Update xong."
   else
     echo "[!] optimai-cli update bị lỗi."
     echo "    -> Hãy chọn menu 10 để Reinstall optimai-cli (xóa + tải lại bản mới)."
-    send_telegram "<b>⚠️ optimai-cli update lỗi</b>%0A$SERVER_INFO%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")"
+    send_telegram "<b>⚠️ optimai-cli update lỗi</b>%0A$SERVER_INFO%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     return 1
   fi
   echo
@@ -533,7 +600,7 @@ apply_telegram_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.6"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.7"
   echo "1) Cài đặt node lần đầu (tự động watchdog service + Telegram)"
   echo "2) Xem log node (tmux session '$TMUX_SESSION')"
   echo "3) Cập nhật node"
