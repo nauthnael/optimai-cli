@@ -39,7 +39,7 @@
 
 ## Yêu cầu hệ thống
 
-- **OS:** Ubuntu 20.04 / 22.04 / 24.04 (hoặc Debian tương đương)
+- **OS:** Ubuntu 24.04 (hoặc Debian tương đương)
 - **Quyền:** `root` (hoặc `sudo`)
 - **Kết nối:** Internet để tải CLI và gửi Telegram
 
