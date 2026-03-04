@@ -56,7 +56,7 @@ Các gói phụ thuộc dưới đây script sẽ **tự động cài** nếu ch
 
 ```bash
 # Tải script
-wget -O optimai.sh https://raw.githubusercontent.com/.../optimai-1_1_12.sh
+wget -O optimai.sh https://raw.githubusercontent.com/nauthnael/optimai-cli/main/optimai.sh
 chmod +x optimai.sh
 
 # Chạy (bắt buộc root)
