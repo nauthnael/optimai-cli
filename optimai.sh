@@ -4,9 +4,15 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.16
+# Version: 1.1.17
 #
 # Updates:
+# v1.1.17:
+#   - Fix do_login() và watchdog_auto_login():
+#     + Thêm "after 200" trước send password (200ms delay)
+#     + CLI dùng getpass() để đọc password — cần tắt echo terminal trước
+#     + Nếu send quá sớm, password bị gửi khi echo chưa tắt → CLI nhận sai
+#     + after 200 đảm bảo CLI đã tắt echo xong mới nhận password
 # v1.1.16:
 #   - Tách auto_login() thành 2 hàm rõ trách nhiệm:
 #     + do_login(email, pass): login thật, không --force
@@ -97,7 +103,7 @@ ARG_PASSWORD=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.16)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.17)"
   echo "============================================================"
   echo
 }
@@ -395,7 +401,7 @@ reinstall_cli() {
 }
 
 # ============================================================
-# AUTO LOGIN (v1.1.16)
+# AUTO LOGIN (v1.1.17)
 #
 # Tách thành 2 hàm:
 #   do_login(email, pass)        — login thật bằng expect
@@ -438,9 +444,10 @@ do_login() {
       }
 
       # Giai đoạn 2: chờ prompt Password (timeout 30s)
+      # after 200: chờ CLI tắt echo terminal xong mới gửi password
       set timeout 30
       expect {
-        -re {(?i)(password|pass)} { send "$password\r" }
+        -re {(?i)(password|pass)} { after 200; send "$password\r" }
         timeout { puts "TIMEOUT_PASSWORD"; exit 1 }
         eof     { puts "EOF_PASSWORD"; exit 1 }
       }
@@ -476,7 +483,6 @@ do_login() {
   fi
 }
 
-# check_and_login EMAIL PASSWORD
 # Kiểm tra auth status trước. Nếu đã login → return 0 ngay (không login lại).
 # Nếu chưa login → gọi do_login().
 # Dùng cho: menu 1 (install/start node), menu 11 (re-login thủ công)
@@ -610,7 +616,7 @@ relogin_node() {
 }
 
 # ============================================================
-# WATCHDOG (v1.1.16)
+# WATCHDOG (v1.1.17)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
 # Phương án A: chỉ check auth khi node DOWN (không gọi mỗi 60s)
 # Phương án A: check auth khi node DOWN + do_login không --force
@@ -619,7 +625,7 @@ relogin_node() {
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.16
+# OptimAI Watchdog v1.1.17
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -730,9 +736,10 @@ watchdog_auto_login() {
       }
 
       # Giai đoạn 2: chờ prompt Password (timeout 30s)
+      # after 200: chờ CLI tắt echo terminal xong mới gửi password
       set timeout 30
       expect {
-        -re {(?i)(password|pass)} { send "$password\r" }
+        -re {(?i)(password|pass)} { after 200; send "$password\r" }
         timeout { puts "TIMEOUT_PASSWORD"; exit 1 }
         eof     { puts "EOF_PASSWORD"; exit 1 }
       }
@@ -913,7 +920,7 @@ WATCHDOG_EOF
 create_watchdog_service() {
   cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.16 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.17 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -1085,7 +1092,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.16"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.17"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
