@@ -4,9 +4,19 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.15
+# Version: 1.1.16
 #
 # Updates:
+# v1.1.16:
+#   - Tách auto_login() thành 2 hàm rõ trách nhiệm:
+#     + do_login(email, pass): login thật, không --force
+#       Dùng cho: menu 12 (test credentials mới), watchdog (auth đã expire)
+#     + check_and_login(email, pass): check auth status trước
+#       Nếu đã login → return 0 ngay (không login lại, nhanh)
+#       Nếu chưa login → gọi do_login()
+#       Dùng cho: menu 1 (install/start node), menu 11 (re-login thủ công)
+#   - Bỏ hoàn toàn --force: không cần thiết với logic mới
+#   - Kết quả: menu 1 chạy lại node khi đã login → xong ngay, không chờ
 # v1.1.15:
 #   - Fix auto_login() Giai đoạn 3:
 #     + Tăng timeout lên 120s (2 phút) để chờ server OptimAI xử lý chậm
@@ -87,7 +97,7 @@ ARG_PASSWORD=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.15)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.16)"
   echo "============================================================"
   echo
 }
@@ -256,10 +266,10 @@ configure_credentials() {
   save_credentials "$email" "$password"
   echo "[✓] Đã lưu credentials: $CREDENTIALS_CONFIG (chmod 600)"
 
-  # Test login ngay
+  # Test login với credentials mới — dùng do_login (login thật, không check trước)
   echo
-  echo "[*] Test login ngay để xác nhận..."
-  if auto_login "$email" "$password"; then
+  echo "[*] Test login ngay để xác nhận credentials..."
+  if do_login "$email" "$password"; then
     send_telegram "<b>🔑 Credentials Đã Lưu & Login OK</b>%0A${SERVER_INFO}%0AAccount: ${email}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "[✓] Credentials hợp lệ và đã lưu."
   else
@@ -385,30 +395,39 @@ reinstall_cli() {
 }
 
 # ============================================================
-# AUTO LOGIN
+# AUTO LOGIN (v1.1.16)
+#
+# Tách thành 2 hàm:
+#   do_login(email, pass)        — login thật bằng expect
+#   check_and_login(email, pass) — check auth trước, chỉ login khi cần
+#
 # Truyền email/password qua env var → expect đọc $env(...)
 # An toàn với mọi ký tự đặc biệt: !, @, #, $, ", \, backtick
 # ============================================================
 
-auto_login() {
+# do_login EMAIL PASSWORD
+# Login thật bằng expect. Không check auth trước.
+# Dùng cho: menu 12 (test credentials mới), watchdog (auth đã xác nhận expire)
+do_login() {
   local email="$1"
   local password="$2"
 
   install_expect_if_needed
 
-  echo "[*] Auto login: $email"
+  echo "[*] Đang login: $email"
 
-  # --force    : bỏ qua "Already logged in"
-  # 3 giai đoạn: không dùng exp_continue sau send password
-  # Giai đoạn 3: timeout 120s, KHÔNG exit 1 — server OptimAI có thể chậm
-  # Nguồn sự thật duy nhất: auth status SAU KHI expect thoát
+  # 3 giai đoạn — không dùng --force, không dùng exp_continue:
+  #   Giai đoạn 1: chờ prompt Email  → gửi email    (timeout 30s → lỗi)
+  #   Giai đoạn 2: chờ prompt Pass   → gửi password (timeout 30s → lỗi)
+  #   Giai đoạn 3: chờ server xử lý  → timeout 120s KHÔNG phải lỗi
+  # Xác nhận kết quả bằng auth status — nguồn sự thật duy nhất
   local output rc
   output=$(EXPECT_EMAIL="$email" EXPECT_PASSWORD="$password" \
     expect -c '
       log_user 1
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
-      spawn '"${CLI_PATH}"' auth login --legacy --force
+      spawn '"${CLI_PATH}"' auth login --legacy
 
       # Giai đoạn 1: chờ prompt Email (timeout 30s)
       set timeout 30
@@ -426,8 +445,8 @@ auto_login() {
         eof     { puts "EOF_PASSWORD"; exit 1 }
       }
 
-      # Giai đoạn 3: chờ server xử lý (timeout 120s)
-      # Timeout và EOF đều KHÔNG phải lỗi — auth status sẽ xác nhận sau
+      # Giai đoạn 3: chờ server xử lý (timeout 120s = 2 phút)
+      # Timeout và EOF KHÔNG phải lỗi — auth status xác nhận sau
       set timeout 120
       expect {
         -re {(?i)(signed in|success|logged in|welcome)} { }
@@ -440,11 +459,11 @@ auto_login() {
   echo "$output"
 
   if [[ $rc -ne 0 ]]; then
-    echo "[!] Expect thoát lỗi (exit $rc) — kiểm tra email/password."
+    echo "[!] Login thất bại (expect exit $rc)."
     return 1
   fi
 
-  # Nguồn sự thật duy nhất: auth status
+  # Xác nhận bằng auth status — nguồn sự thật duy nhất
   echo "[*] Xác nhận auth status..."
   local status_out
   status_out=$("${CLI_PATH}" auth status 2>&1 || true)
@@ -455,6 +474,26 @@ auto_login() {
     echo "[!] Login thất bại — $status_out"
     return 1
   fi
+}
+
+# check_and_login EMAIL PASSWORD
+# Kiểm tra auth status trước. Nếu đã login → return 0 ngay (không login lại).
+# Nếu chưa login → gọi do_login().
+# Dùng cho: menu 1 (install/start node), menu 11 (re-login thủ công)
+check_and_login() {
+  local email="$1"
+  local password="$2"
+
+  echo "[*] Kiểm tra trạng thái đăng nhập..."
+  local status_out
+  status_out=$("${CLI_PATH}" auth status 2>&1 || true)
+  if echo "$status_out" | grep -qi "Logged in"; then
+    echo "[✓] Đã đăng nhập — $status_out"
+    return 0
+  fi
+
+  echo "[*] Chưa đăng nhập. Tiến hành login: $email"
+  do_login "$email" "$password"
 }
 
 # ============================================================
@@ -551,7 +590,8 @@ relogin_node() {
   echo "[*] Tạm stop watchdog trong khi re-login..."
   systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
 
-  if auto_login "$email" "$password"; then
+  # check_and_login: nếu đã login rồi → bỏ qua, không login lại
+  if check_and_login "$email" "$password"; then
     echo
     echo "[*] Restart node sau khi login..."
     if start_node_in_tmux; then
@@ -570,16 +610,16 @@ relogin_node() {
 }
 
 # ============================================================
-# WATCHDOG (v1.1.15)
+# WATCHDOG (v1.1.16)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
 # Phương án A: chỉ check auth khi node DOWN (không gọi mỗi 60s)
-# Fix expect: 3 giai đoạn rõ ràng + --force + xác nhận bằng auth status
+# Phương án A: check auth khi node DOWN + do_login không --force
 # ============================================================
 
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.15
+# OptimAI Watchdog v1.1.16
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -667,7 +707,7 @@ load_credentials() {
 }
 
 watchdog_auto_login() {
-  # --force + 3 giai đoạn + giai đoạn 3 timeout 120s không phải lỗi
+  # Gọi khi auth đã xác nhận expire → login thật, không check lại
   if ! command -v expect >/dev/null 2>&1; then
     log "WARN: expect chưa cài, bỏ qua auto login"
     return 1
@@ -679,7 +719,7 @@ watchdog_auto_login() {
       log_user 0
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
-      spawn '"$CLI_PATH"' auth login --legacy --force
+      spawn '"$CLI_PATH"' auth login --legacy
 
       # Giai đoạn 1: chờ prompt Email (timeout 30s)
       set timeout 30
@@ -873,7 +913,7 @@ WATCHDOG_EOF
 create_watchdog_service() {
   cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.15 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.16 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -1004,7 +1044,8 @@ install_first_time() {
       save_credentials "$email" "$password"
       echo "[✓] Đã lưu credentials."
     fi
-    if ! auto_login "$email" "$password"; then
+    # check_and_login: nếu đã login rồi → bỏ qua ngay, không login lại
+    if ! check_and_login "$email" "$password"; then
       echo "[!] Auto login thất bại. Chuyển sang nhập tay:"
       "$CLI_PATH" auth login --legacy
     fi
@@ -1044,7 +1085,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.15"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.16"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
