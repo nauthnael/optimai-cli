@@ -4,9 +4,17 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.12
+# Version: 1.1.13
 #
 # Updates:
+# v1.1.13:
+#   - Fix save_credentials(): bỏ printf '%q', dùng single-quote wrapping
+#     + escape dấu ' bên trong → source lại chính xác 100% mọi ký tự
+#   - Fix get_email() / get_password(): bỏ echo, dùng printf -v để gán
+#     biến trực tiếp không qua subshell $() → tránh mất ký tự đặc biệt
+#   - Refactor auto_login(): nhận email/pass trực tiếp từ biến, không
+#     qua subshell trung gian
+#   - Watchdog load_credentials(): hưởng lợi tự động từ fix save_credentials
 # v1.1.12:
 #   - Thêm credentials.conf (chmod 600): lưu email/password bảo mật
 #   - Ưu tiên credentials: --email/--password > credentials.conf > hỏi tay
@@ -59,7 +67,7 @@ ARG_PASSWORD=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.12)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.13)"
   echo "============================================================"
   echo
 }
@@ -155,10 +163,15 @@ save_credentials() {
   local email="$1"
   local password="$2"
   mkdir -p "$OPTIMAI_CONFIG_DIR"
-  # Dùng printf để tránh echo interpret escape sequences trong password
-  printf 'OPTIMAI_EMAIL=%s\nOPTIMAI_PASSWORD=%s\n' \
-    "$(printf '%q' "$email")" \
-    "$(printf '%q' "$password")" \
+  # Dùng single-quote wrapping + escape dấu ' bên trong bằng '\''
+  # Đây là cách duy nhất source lại chính xác với MỌI ký tự đặc biệt:
+  # !, @, #, $, ", \, backtick, space, dấu =, v.v.
+  local email_escaped password_escaped
+  email_escaped="${email//\'/\'\\\'\'}"
+  password_escaped="${password//\'/\'\\\'\'}"
+  printf "OPTIMAI_EMAIL='%s'\nOPTIMAI_PASSWORD='%s'\n" \
+    "$email_escaped" \
+    "$password_escaped" \
     > "$CREDENTIALS_CONFIG"
   chmod 600 "$CREDENTIALS_CONFIG"
 }
@@ -176,26 +189,26 @@ load_credentials() {
   return 0
 }
 
-# Lấy email để dùng - ưu tiên: ARG > credentials.conf
-get_email() {
-  if [[ -n "${ARG_EMAIL:-}" ]]; then
-    echo "$ARG_EMAIL"
-  elif load_credentials; then
-    echo "$OPTIMAI_EMAIL"
-  else
-    echo ""
-  fi
-}
+# resolve_credentials VAR_EMAIL VAR_PASSWORD
+# Gán email/password vào 2 biến được chỉ định, KHÔNG qua subshell $()
+# → tránh subshell strip trailing newline và các vấn đề ký tự đặc biệt
+resolve_credentials() {
+  local _evar="$1"
+  local _pvar="$2"
+  local _src_email="" _src_pass=""
 
-# Lấy password để dùng - ưu tiên: ARG > credentials.conf
-get_password() {
-  if [[ -n "${ARG_PASSWORD:-}" ]]; then
-    echo "$ARG_PASSWORD"
-  elif load_credentials; then
-    echo "$OPTIMAI_PASSWORD"
-  else
-    echo ""
+  if [[ -n "${ARG_EMAIL:-}" ]]; then
+    _src_email="$ARG_EMAIL"
+    _src_pass="${ARG_PASSWORD:-}"
+  elif [[ -f "$CREDENTIALS_CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$CREDENTIALS_CONFIG" 2>/dev/null || true
+    _src_email="${OPTIMAI_EMAIL:-}"
+    _src_pass="${OPTIMAI_PASSWORD:-}"
   fi
+
+  printf -v "$_evar" '%s' "$_src_email"
+  printf -v "$_pvar"  '%s' "$_src_pass"
 }
 
 configure_credentials() {
@@ -481,8 +494,7 @@ relogin_node() {
   ensure_cli
 
   local email password
-  email="$(get_email)"
-  password="$(get_password)"
+  resolve_credentials email password
 
   # Nếu không có credentials thì hỏi tay
   if [[ -z "$email" ]]; then
@@ -520,9 +532,10 @@ relogin_node() {
 }
 
 # ============================================================
-# WATCHDOG (v1.1.12)
+# WATCHDOG (v1.1.13)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
-# Thêm mới: check auth status → auto re-login từ credentials.conf
+# Auth check: optimai-cli auth status → auto re-login từ credentials.conf
+# Fix v1.1.13: credentials.conf dùng single-quote wrapping → source đúng
 #
 # Flow mỗi chu kỳ:
 #   1. auth status → Not authenticated?
@@ -535,7 +548,7 @@ relogin_node() {
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.12
+# OptimAI Watchdog v1.1.13
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -921,8 +934,7 @@ install_first_time() {
   prefetch_crawler_image
 
   local email password
-  email="$(get_email)"
-  password="$(get_password)"
+  resolve_credentials email password
 
   if [[ -n "$email" && -n "$password" ]]; then
     echo "[*] Dùng credentials đã có (${email})..."
@@ -971,7 +983,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.12"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.13"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
