@@ -4,9 +4,22 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.13
+# Version: 1.1.14
 #
 # Updates:
+# v1.1.14:
+#   - Fix auto_login(): tách expect thành 3 giai đoạn rõ ràng
+#     + Giai đoạn 1: chờ prompt Email → gửi email
+#     + Giai đoạn 2: chờ prompt Password → gửi password
+#     + Giai đoạn 3: chờ kết quả, chấp nhận EOF (CLI thoát ngay sau login)
+#     + Bỏ exp_continue sau send password (gây timeout vì loop chờ pattern)
+#     + Xác nhận thành công bằng auth status thay vì parse text output
+#     + Thêm --force để bỏ qua "Already logged in"
+#   - Watchdog (Phương án A): bỏ check auth status mỗi chu kỳ
+#     + Chỉ check auth khi node DOWN, ngay trước khi restart
+#     + Giảm tải server: không còn gọi auth status mỗi 60s
+#     + Logic: tmux down → check auth → re-login nếu cần → restart
+#   - watchdog_auto_login(): áp dụng cùng fix 3 giai đoạn
 # v1.1.13:
 #   - Fix save_credentials(): bỏ printf '%q', dùng single-quote wrapping
 #     + escape dấu ' bên trong → source lại chính xác 100% mọi ký tự
@@ -67,7 +80,7 @@ ARG_PASSWORD=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.13)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.14)"
   echo "============================================================"
   echo
 }
@@ -378,32 +391,44 @@ auto_login() {
 
   echo "[*] Auto login: $email"
 
-  local output
+  # Dùng --force để bỏ qua "Already logged in" nếu session cũ còn đó
+  # Tách 3 giai đoạn rõ ràng, KHÔNG dùng exp_continue sau send password:
+  #   Giai đoạn 1: chờ prompt Email  → gửi email
+  #   Giai đoạn 2: chờ prompt Pass   → gửi password
+  #   Giai đoạn 3: chờ kết quả/EOF   → CLI thoát ngay sau login, EOF là bình thường
+  # Xác nhận thành công bằng auth status, không parse text output
+  local output rc
   output=$(EXPECT_EMAIL="$email" EXPECT_PASSWORD="$password" \
     expect -c '
       log_user 1
       set timeout 30
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
-      spawn '"${CLI_PATH}"' auth login --legacy
+      spawn '"${CLI_PATH}"' auth login --legacy --force
+
+      # Giai đoạn 1: chờ prompt Email
       expect {
-        -re {(?i)(email|e-mail|username)} {
-          send "$email\r"
-          exp_continue
-        }
-        -re {(?i)(password|pass)} {
-          send "$password\r"
-          exp_continue
-        }
-        -re {(?i)(success|logged in|welcome|done|ok)} {}
-        timeout {
-          puts "\nERROR: Login timeout"
-          exit 1
-        }
-        eof {}
+        -re {(?i)(email|e-mail|username|login)} { send "$email\r" }
+        timeout { puts "TIMEOUT_EMAIL"; exit 1 }
+        eof     { puts "EOF_EMAIL";    exit 1 }
+      }
+
+      # Giai đoạn 2: chờ prompt Password
+      expect {
+        -re {(?i)(password|pass)} { send "$password\r" }
+        timeout { puts "TIMEOUT_PASSWORD"; exit 1 }
+        eof     { puts "EOF_PASSWORD"; exit 1 }
+      }
+
+      # Giai đoạn 3: chờ kết quả
+      # CLI thoát ngay sau khi in kết quả → EOF là bình thường
+      expect {
+        -re {(?i)(signed in|success|logged in|welcome)} { }
+        timeout { puts "TIMEOUT_RESULT"; exit 1 }
+        eof     { }
       }
     ' 2>&1)
-  local rc=$?
+  rc=$?
 
   echo "$output"
 
@@ -411,12 +436,17 @@ auto_login() {
     echo "[!] Auto login thất bại (exit $rc)."
     return 1
   fi
-  if echo "$output" | grep -qiE "(error|invalid|incorrect|failed|wrong)"; then
-    echo "[!] Login thất bại — kiểm tra email/password."
+
+  # Xác nhận bằng auth status — đáng tin hơn parse text output
+  local status_out
+  status_out=$("${CLI_PATH}" auth status 2>&1 || true)
+  if echo "$status_out" | grep -qi "Logged in"; then
+    echo "[✓] Login thành công — auth status: $status_out"
+    return 0
+  else
+    echo "[!] Login thất bại — auth status: $status_out"
     return 1
   fi
-  echo "[✓] Login thành công."
-  return 0
 }
 
 # ============================================================
@@ -532,23 +562,16 @@ relogin_node() {
 }
 
 # ============================================================
-# WATCHDOG (v1.1.13)
+# WATCHDOG (v1.1.14)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
-# Auth check: optimai-cli auth status → auto re-login từ credentials.conf
-# Fix v1.1.13: credentials.conf dùng single-quote wrapping → source đúng
-#
-# Flow mỗi chu kỳ:
-#   1. auth status → Not authenticated?
-#      → có credentials → auto_login → reset restart_log
-#      → không có credentials → Telegram cảnh báo, skip
-#   2. tmux has-session → node down?
-#      → restart (với block logic giữ nguyên)
+# Phương án A: chỉ check auth khi node DOWN (không gọi mỗi 60s)
+# Fix expect: 3 giai đoạn rõ ràng + --force + xác nhận bằng auth status
 # ============================================================
 
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.13
+# OptimAI Watchdog v1.1.14
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -636,7 +659,7 @@ load_credentials() {
 }
 
 watchdog_auto_login() {
-  # Dùng expect, truyền credentials qua env var (an toàn với ký tự đặc biệt)
+  # Tách 3 giai đoạn, thêm --force, xác nhận bằng auth status
   if ! command -v expect >/dev/null 2>&1; then
     log "WARN: expect chưa cài, bỏ qua auto login"
     return 1
@@ -649,24 +672,46 @@ watchdog_auto_login() {
       set timeout 30
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
-      spawn '"$CLI_PATH"' auth login --legacy
+      spawn '"$CLI_PATH"' auth login --legacy --force
+
+      # Giai đoạn 1: chờ prompt Email
       expect {
-        -re {(?i)(email|e-mail|username)} { send "$email\r";    exp_continue }
-        -re {(?i)(password|pass)}         { send "$password\r"; exp_continue }
-        -re {(?i)(success|logged in|welcome|done|ok)} {}
-        timeout { puts "LOGIN_TIMEOUT"; exit 1 }
-        eof {}
+        -re {(?i)(email|e-mail|username|login)} { send "$email\r" }
+        timeout { puts "TIMEOUT_EMAIL"; exit 1 }
+        eof     { puts "EOF_EMAIL";    exit 1 }
+      }
+
+      # Giai đoạn 2: chờ prompt Password
+      expect {
+        -re {(?i)(password|pass)} { send "$password\r" }
+        timeout { puts "TIMEOUT_PASSWORD"; exit 1 }
+        eof     { puts "EOF_PASSWORD"; exit 1 }
+      }
+
+      # Giai đoạn 3: chờ kết quả / EOF
+      expect {
+        -re {(?i)(signed in|success|logged in|welcome)} { }
+        timeout { puts "TIMEOUT_RESULT"; exit 1 }
+        eof     { }
       }
     ' 2>&1)
   rc=$?
 
-  if [[ $rc -ne 0 ]] || echo "$output" | grep -q "LOGIN_TIMEOUT"; then
+  if [[ $rc -ne 0 ]]; then
+    log "AUTH: expect exit $rc — output: $output"
     return 1
   fi
-  if echo "$output" | grep -qiE "(error|invalid|incorrect|failed|wrong)"; then
+
+  # Xác nhận bằng auth status
+  local status_out
+  status_out=$("$CLI_PATH" auth status 2>&1 || true)
+  if echo "$status_out" | grep -qi "Logged in"; then
+    log "AUTH: Xác nhận auth status OK"
+    return 0
+  else
+    log "AUTH: auth status sau login: $status_out"
     return 1
   fi
-  return 0
 }
 
 # ============================================================
@@ -706,8 +751,23 @@ while true; do
   log "=== CHECK START ==="
 
   # ----------------------------------------------------------
-  # BƯỚC 1: Kiểm tra auth status
+  # BƯỚC 1: Kiểm tra node có đang chạy không
+  # (Phương án A: KHÔNG check auth mỗi chu kỳ — giảm tải server)
   # ----------------------------------------------------------
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    log "NODE: OK - tmux session '$TMUX_SESSION' alive"
+    log "=== CHECK END - sleep ${SLEEP_INTERVAL}s ==="
+    sleep "$SLEEP_INTERVAL"
+    continue
+  fi
+
+  # ----------------------------------------------------------
+  # BƯỚC 2: Node DOWN → check auth trước khi restart
+  # Chỉ gọi auth status khi cần, không gọi mỗi 60s
+  # ----------------------------------------------------------
+  log "NODE: DOWN - tmux session '$TMUX_SESSION' không tìm thấy"
+  log "AUTH: Kiểm tra trạng thái đăng nhập..."
+
   if ! check_auth_status; then
     log "AUTH: Not authenticated — bắt đầu re-login..."
 
@@ -718,40 +778,30 @@ while true; do
       if watchdog_auto_login; then
         log "AUTH: Re-login thành công ($OPTIMAI_EMAIL)"
         send_telegram "<b>✅ Re-login Thành Công</b>%0A${SERVER_INFO}%0AAccount: ${OPTIMAI_EMAIL}%0AThời gian: $(ts)"
-        # Reset restart counter: lần này node tắt vì auth, không phải crash
+        # Reset restart counter: node tắt vì auth expire, không phải crash
         reset_restart_log
-        # Tiếp tục xuống để check tmux và start node nếu cần
+        # Tiếp tục xuống để restart node
       else
         log "AUTH: Re-login THẤT BẠI ($OPTIMAI_EMAIL)"
-        send_telegram "<b>❌ Re-login Thất Bại</b>%0A${SERVER_INFO}%0AAccount: ${OPTIMAI_EMAIL}%0AKiểm tra credentials (menu 12) hoặc đổi mật khẩu.%0AThời gian: $(ts)"
+        send_telegram "<b>❌ Re-login Thất Bại</b>%0A${SERVER_INFO}%0AAccount: ${OPTIMAI_EMAIL}%0AKiểm tra credentials (menu 12).%0AThời gian: $(ts)"
         log "=== CHECK END (auth fail) - sleep ${SLEEP_INTERVAL}s ==="
         sleep "$SLEEP_INTERVAL"
         continue
       fi
     else
-      log "AUTH: Không tìm thấy credentials, không thể tự re-login"
-      send_telegram "<b>⚠️ Auth Hết Hạn - Không Có Credentials</b>%0A${SERVER_INFO}%0AChạy menu 12 để lưu credentials, hoặc menu 11 để re-login thủ công.%0AThời gian: $(ts)"
+      log "AUTH: Không có credentials — không thể tự re-login"
+      send_telegram "<b>⚠️ Auth Hết Hạn - Không Có Credentials</b>%0A${SERVER_INFO}%0AChạy menu 12 để lưu credentials.%0AThời gian: $(ts)"
       log "=== CHECK END (no credentials) - sleep ${SLEEP_INTERVAL}s ==="
       sleep "$SLEEP_INTERVAL"
       continue
     fi
+  else
+    log "AUTH: OK - đã đăng nhập"
   fi
 
   # ----------------------------------------------------------
-  # BƯỚC 2: Kiểm tra node có đang chạy không
+  # BƯỚC 3: Thực hiện restart node (với block logic)
   # ----------------------------------------------------------
-  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    log "NODE: OK - tmux session '$TMUX_SESSION' alive"
-    log "=== CHECK END - sleep ${SLEEP_INTERVAL}s ==="
-    sleep "$SLEEP_INTERVAL"
-    continue
-  fi
-
-  # ----------------------------------------------------------
-  # BƯỚC 3: Node DOWN → xử lý restart (với block logic)
-  # ----------------------------------------------------------
-  log "NODE: DOWN - tmux session '$TMUX_SESSION' không tìm thấy"
-
   local_now=$(now_ts)
   count=$(clean_and_count_restarts)
   log "NODE: Restart count trong ${WINDOW}s: ${count}/${MAX_RESTARTS}"
@@ -812,7 +862,7 @@ WATCHDOG_EOF
 create_watchdog_service() {
   cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.12 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.14 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -983,7 +1033,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.13"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.14"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
