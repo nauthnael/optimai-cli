@@ -4,9 +4,16 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.14
+# Version: 1.1.15
 #
 # Updates:
+# v1.1.15:
+#   - Fix auto_login() Giai đoạn 3:
+#     + Tăng timeout lên 120s (2 phút) để chờ server OptimAI xử lý chậm
+#     + Timeout không còn là lỗi — chờ xong rồi dùng auth status xác nhận
+#     + EOF cũng không phải lỗi
+#     + Nguồn sự thật duy nhất: auth status sau khi expect thoát
+#   - Áp dụng cùng fix cho watchdog_auto_login()
 # v1.1.14:
 #   - Fix auto_login(): tách expect thành 3 giai đoạn rõ ràng
 #     + Giai đoạn 1: chờ prompt Email → gửi email
@@ -80,7 +87,7 @@ ARG_PASSWORD=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.14)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.15)"
   echo "============================================================"
   echo
 }
@@ -391,40 +398,40 @@ auto_login() {
 
   echo "[*] Auto login: $email"
 
-  # Dùng --force để bỏ qua "Already logged in" nếu session cũ còn đó
-  # Tách 3 giai đoạn rõ ràng, KHÔNG dùng exp_continue sau send password:
-  #   Giai đoạn 1: chờ prompt Email  → gửi email
-  #   Giai đoạn 2: chờ prompt Pass   → gửi password
-  #   Giai đoạn 3: chờ kết quả/EOF   → CLI thoát ngay sau login, EOF là bình thường
-  # Xác nhận thành công bằng auth status, không parse text output
+  # --force    : bỏ qua "Already logged in"
+  # 3 giai đoạn: không dùng exp_continue sau send password
+  # Giai đoạn 3: timeout 120s, KHÔNG exit 1 — server OptimAI có thể chậm
+  # Nguồn sự thật duy nhất: auth status SAU KHI expect thoát
   local output rc
   output=$(EXPECT_EMAIL="$email" EXPECT_PASSWORD="$password" \
     expect -c '
       log_user 1
-      set timeout 30
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
       spawn '"${CLI_PATH}"' auth login --legacy --force
 
-      # Giai đoạn 1: chờ prompt Email
+      # Giai đoạn 1: chờ prompt Email (timeout 30s)
+      set timeout 30
       expect {
         -re {(?i)(email|e-mail|username|login)} { send "$email\r" }
         timeout { puts "TIMEOUT_EMAIL"; exit 1 }
         eof     { puts "EOF_EMAIL";    exit 1 }
       }
 
-      # Giai đoạn 2: chờ prompt Password
+      # Giai đoạn 2: chờ prompt Password (timeout 30s)
+      set timeout 30
       expect {
         -re {(?i)(password|pass)} { send "$password\r" }
         timeout { puts "TIMEOUT_PASSWORD"; exit 1 }
         eof     { puts "EOF_PASSWORD"; exit 1 }
       }
 
-      # Giai đoạn 3: chờ kết quả
-      # CLI thoát ngay sau khi in kết quả → EOF là bình thường
+      # Giai đoạn 3: chờ server xử lý (timeout 120s)
+      # Timeout và EOF đều KHÔNG phải lỗi — auth status sẽ xác nhận sau
+      set timeout 120
       expect {
         -re {(?i)(signed in|success|logged in|welcome)} { }
-        timeout { puts "TIMEOUT_RESULT"; exit 1 }
+        timeout { }
         eof     { }
       }
     ' 2>&1)
@@ -433,18 +440,19 @@ auto_login() {
   echo "$output"
 
   if [[ $rc -ne 0 ]]; then
-    echo "[!] Auto login thất bại (exit $rc)."
+    echo "[!] Expect thoát lỗi (exit $rc) — kiểm tra email/password."
     return 1
   fi
 
-  # Xác nhận bằng auth status — đáng tin hơn parse text output
+  # Nguồn sự thật duy nhất: auth status
+  echo "[*] Xác nhận auth status..."
   local status_out
   status_out=$("${CLI_PATH}" auth status 2>&1 || true)
   if echo "$status_out" | grep -qi "Logged in"; then
-    echo "[✓] Login thành công — auth status: $status_out"
+    echo "[✓] Login thành công — $status_out"
     return 0
   else
-    echo "[!] Login thất bại — auth status: $status_out"
+    echo "[!] Login thất bại — $status_out"
     return 1
   fi
 }
@@ -562,7 +570,7 @@ relogin_node() {
 }
 
 # ============================================================
-# WATCHDOG (v1.1.14)
+# WATCHDOG (v1.1.15)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
 # Phương án A: chỉ check auth khi node DOWN (không gọi mỗi 60s)
 # Fix expect: 3 giai đoạn rõ ràng + --force + xác nhận bằng auth status
@@ -571,7 +579,7 @@ relogin_node() {
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.14
+# OptimAI Watchdog v1.1.15
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -659,7 +667,7 @@ load_credentials() {
 }
 
 watchdog_auto_login() {
-  # Tách 3 giai đoạn, thêm --force, xác nhận bằng auth status
+  # --force + 3 giai đoạn + giai đoạn 3 timeout 120s không phải lỗi
   if ! command -v expect >/dev/null 2>&1; then
     log "WARN: expect chưa cài, bỏ qua auto login"
     return 1
@@ -669,29 +677,32 @@ watchdog_auto_login() {
   output=$(EXPECT_EMAIL="$OPTIMAI_EMAIL" EXPECT_PASSWORD="$OPTIMAI_PASSWORD" \
     expect -c '
       log_user 0
-      set timeout 30
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
       spawn '"$CLI_PATH"' auth login --legacy --force
 
-      # Giai đoạn 1: chờ prompt Email
+      # Giai đoạn 1: chờ prompt Email (timeout 30s)
+      set timeout 30
       expect {
         -re {(?i)(email|e-mail|username|login)} { send "$email\r" }
         timeout { puts "TIMEOUT_EMAIL"; exit 1 }
         eof     { puts "EOF_EMAIL";    exit 1 }
       }
 
-      # Giai đoạn 2: chờ prompt Password
+      # Giai đoạn 2: chờ prompt Password (timeout 30s)
+      set timeout 30
       expect {
         -re {(?i)(password|pass)} { send "$password\r" }
         timeout { puts "TIMEOUT_PASSWORD"; exit 1 }
         eof     { puts "EOF_PASSWORD"; exit 1 }
       }
 
-      # Giai đoạn 3: chờ kết quả / EOF
+      # Giai đoạn 3: chờ server xử lý (timeout 120s)
+      # Timeout và EOF đều KHÔNG phải lỗi — auth status xác nhận sau
+      set timeout 120
       expect {
         -re {(?i)(signed in|success|logged in|welcome)} { }
-        timeout { puts "TIMEOUT_RESULT"; exit 1 }
+        timeout { }
         eof     { }
       }
     ' 2>&1)
@@ -702,14 +713,14 @@ watchdog_auto_login() {
     return 1
   fi
 
-  # Xác nhận bằng auth status
+  # Nguồn sự thật duy nhất: auth status
   local status_out
   status_out=$("$CLI_PATH" auth status 2>&1 || true)
   if echo "$status_out" | grep -qi "Logged in"; then
     log "AUTH: Xác nhận auth status OK"
     return 0
   else
-    log "AUTH: auth status sau login: $status_out"
+    log "AUTH: Login thất bại — auth status: $status_out"
     return 1
   fi
 }
@@ -862,7 +873,7 @@ WATCHDOG_EOF
 create_watchdog_service() {
   cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.14 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.15 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -1033,7 +1044,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.14"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.15"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
