@@ -4,17 +4,20 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.18
+# Version: 1.1.19
 #
 # Updates:
+# v1.1.19:
+#   - Fix watchdog_auto_login(): thêm setsid trước expect
+#     + v1.1.18 dùng TTYPath=/dev/tty1 → VPS không có console vật lý
+#       → kernel gửi SIGHUP → watchdog chết ngay khi khởi động
+#     + Fix: bỏ TTY khỏi unit file, dùng setsid thay thế
+#     + setsid tạo session mới → expect tự allocate PTY riêng
+#     + Không cần TTY từ systemd, watchdog chạy ổn định
+#   - Bỏ StandardInput=tty-force, TTYPath, TTYReset, TTYVHangup khỏi unit file
 # v1.1.18:
-#   - Fix watchdog_auto_login() thất bại khi chạy dưới systemd:
-#     + Nguyên nhân: systemd không có TTY → expect không thể spawn CLI
-#       đúng cách → CLI không nhận được password qua PTY
-#     + Fix: thêm StandardInput=tty-force + TTYPath=/dev/tty1 vào unit file
-#     + systemd cấp phát TTY thật cho watchdog service
-#     + expect có đầy đủ TTY để spawn CLI và gửi password bình thường
-#     + Giữ nguyên toàn bộ logic expect (không thay đổi watchdog_auto_login)
+#   - Thử fix watchdog bằng TTYPath=/dev/tty1 (không thành công trên VPS)
+#     + Gây SIGHUP ngay khi start → revert ở v1.1.19
 # v1.1.17:
 #   - Fix do_login() và watchdog_auto_login():
 #     + Thêm "after 200" trước send password (200ms delay)
@@ -111,7 +114,7 @@ ARG_PASSWORD=""
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.18)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.19)"
   echo "============================================================"
   echo
 }
@@ -409,7 +412,7 @@ reinstall_cli() {
 }
 
 # ============================================================
-# AUTO LOGIN (v1.1.18)
+# AUTO LOGIN (v1.1.19)
 #
 # Tách thành 2 hàm:
 #   do_login(email, pass)        — login thật bằng expect
@@ -624,7 +627,7 @@ relogin_node() {
 }
 
 # ============================================================
-# WATCHDOG (v1.1.18)
+# WATCHDOG (v1.1.19)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
 # Phương án A: chỉ check auth khi node DOWN (không gọi mỗi 60s)
 # Phương án A: check auth khi node DOWN + do_login không --force
@@ -633,7 +636,7 @@ relogin_node() {
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.18
+# OptimAI Watchdog v1.1.19
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -722,6 +725,8 @@ load_credentials() {
 
 watchdog_auto_login() {
   # Gọi khi auth đã xác nhận expire → login thật, không check lại
+  # setsid: tạo session mới → expect tự allocate PTY riêng
+  # Cần thiết vì watchdog chạy dưới systemd (không có controlling TTY)
   if ! command -v expect >/dev/null 2>&1; then
     log "WARN: expect chưa cài, bỏ qua auto login"
     return 1
@@ -729,7 +734,7 @@ watchdog_auto_login() {
 
   local output rc
   output=$(EXPECT_EMAIL="$OPTIMAI_EMAIL" EXPECT_PASSWORD="$OPTIMAI_PASSWORD" \
-    expect -c '
+    setsid expect -c '
       log_user 0
       set email    $env(EXPECT_EMAIL)
       set password $env(EXPECT_PASSWORD)
@@ -928,7 +933,7 @@ WATCHDOG_EOF
 create_watchdog_service() {
   cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.18 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.19 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -939,12 +944,6 @@ Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-# TTY: cần thiết để expect có thể spawn CLI và nhận password đúng cách
-# Không có TTY → watchdog_auto_login thất bại dù credentials đúng
-StandardInput=tty-force
-TTYPath=/dev/tty1
-TTYReset=yes
-TTYVHangup=yes
 User=root
 
 [Install]
@@ -1106,7 +1105,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.18"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.19"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
