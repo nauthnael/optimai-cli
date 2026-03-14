@@ -4,9 +4,23 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.19
+# Version: 1.1.20
 #
 # Updates:
+# v1.1.20:
+#   - Hỗ trợ Devuan (SysVinit) song song với Debian/Ubuntu (systemd)
+#   - Thêm detect_init(): tự động nhận diện init system khi khởi động
+#     + systemd: dùng systemctl (Debian, Ubuntu)
+#     + sysvinit: dùng service + update-rc.d (Devuan mặc định)
+#     + runit: dùng sv (Devuan với runit)
+#   - Thêm 7 wrapper functions thay thế toàn bộ systemctl calls:
+#     svc_start / svc_stop / svc_enable / svc_disable /
+#     svc_status / svc_reload / svc_log
+#   - create_watchdog_service(): tách nhánh systemd vs sysvinit
+#     + systemd  → /etc/systemd/system/optimai-watchdog.service
+#     + sysvinit → /etc/init.d/optimai-watchdog (SysV init script)
+#     + runit    → /etc/sv/optimai-watchdog/run
+#   - Tất cả menu (5,6,7,8,9,11) hoạt động đúng trên cả 2 distro
 # v1.1.19:
 #   - Fix watchdog_auto_login(): thêm setsid trước expect
 #     + v1.1.18 dùng TTYPath=/dev/tty1 → VPS không có console vật lý
@@ -95,7 +109,6 @@ CLI_PATH="/usr/local/bin/optimai-cli"
 CLI_URL="https://cli-node.optimai.network/optimai_cli_ubuntu"
 
 WATCHDOG_SCRIPT="/usr/local/bin/optimai-watchdog"
-WATCHDOG_SERVICE="optimai-watchdog.service"
 
 OPTIMAI_CONFIG_DIR="/etc/optimai"
 TELEGRAM_CONFIG="${OPTIMAI_CONFIG_DIR}/telegram.conf"
@@ -108,13 +121,128 @@ ARG_EMAIL=""
 ARG_PASSWORD=""
 
 # ============================================================
+# INIT SYSTEM DETECTION & SERVICE WRAPPERS
+# Hỗ trợ: systemd (Debian/Ubuntu) | sysvinit (Devuan) | runit (Devuan runit)
+# ============================================================
+
+detect_init() {
+  if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
+    echo "systemd"
+  elif command -v sv &>/dev/null && [[ -d /etc/sv ]]; then
+    echo "runit"
+  elif [[ -d /etc/init.d ]]; then
+    echo "sysvinit"
+  else
+    echo "unknown"
+  fi
+}
+
+INIT_SYSTEM=$(detect_init)
+
+# Tên service không có .service suffix (dùng cho sysvinit/runit)
+WATCHDOG_SERVICE_NAME="optimai-watchdog"
+# Tên đầy đủ cho systemd
+WATCHDOG_SERVICE="${WATCHDOG_SERVICE_NAME}.service"
+# SysV init script path
+WATCHDOG_INITD="/etc/init.d/${WATCHDOG_SERVICE_NAME}"
+# Runit service dir
+WATCHDOG_RUNIT="/etc/sv/${WATCHDOG_SERVICE_NAME}"
+
+svc_start() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)  systemctl start  "$name"         2>/dev/null || true ;;
+    runit)    sv start "${name%.service}"      2>/dev/null || true ;;
+    *)        service  "${name%.service}" start 2>/dev/null || true ;;
+  esac
+}
+
+svc_stop() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)  systemctl stop   "$name"         2>/dev/null || true ;;
+    runit)    sv stop  "${name%.service}"      2>/dev/null || true ;;
+    *)        service  "${name%.service}" stop  2>/dev/null || true ;;
+  esac
+}
+
+svc_enable() {
+  # Enable + start service
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      systemctl enable --now "$name" 2>/dev/null || true
+      ;;
+    runit)
+      ln -sf "$WATCHDOG_RUNIT" /etc/service/ 2>/dev/null || true
+      ;;
+    *)
+      update-rc.d "${name%.service}" defaults 2>/dev/null || true
+      service "${name%.service}" start 2>/dev/null || true
+      ;;
+  esac
+}
+
+svc_disable() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      systemctl disable "$name" 2>/dev/null || true
+      ;;
+    runit)
+      rm -f "/etc/service/${name%.service}" 2>/dev/null || true
+      sv stop "${name%.service}" 2>/dev/null || true
+      ;;
+    *)
+      service "${name%.service}" stop 2>/dev/null || true
+      update-rc.d "${name%.service}" remove 2>/dev/null || true
+      ;;
+  esac
+}
+
+svc_status() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)  systemctl status "$name" --no-pager 2>/dev/null || true ;;
+    runit)    sv status "${name%.service}"         2>/dev/null || true ;;
+    *)        service   "${name%.service}" status  2>/dev/null || true ;;
+  esac
+}
+
+svc_reload() {
+  # daemon-reload chỉ cần với systemd
+  case "$INIT_SYSTEM" in
+    systemd)  systemctl daemon-reload 2>/dev/null || true ;;
+    *)        true ;;
+  esac
+}
+
+svc_log() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)  journalctl -u "$name" -n 50 --no-pager 2>/dev/null || true ;;
+    *)        tail -50 /var/log/optimai-watchdog.log 2>/dev/null || true ;;
+  esac
+}
+
+svc_log_cmd() {
+  # Trả về chuỗi lệnh xem log live (dùng trong hint/Telegram)
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)  echo "journalctl -u $name -f" ;;
+    *)        echo "tail -f /var/log/optimai-watchdog.log" ;;
+  esac
+}
+
+
+# ============================================================
 # BANNER & UTILS
 # ============================================================
 
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.19)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.20)"
   echo "============================================================"
   echo
 }
@@ -332,7 +460,7 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io \
     docker-buildx-plugin docker-compose-plugin
-  systemctl enable --now docker
+  svc_enable "docker"
   echo "[✓] Docker đã cài."
 }
 
@@ -412,7 +540,7 @@ reinstall_cli() {
 }
 
 # ============================================================
-# AUTO LOGIN (v1.1.19)
+# AUTO LOGIN (v1.1.20)
 #
 # Tách thành 2 hàm:
 #   do_login(email, pass)        — login thật bằng expect
@@ -605,7 +733,7 @@ relogin_node() {
   fi
 
   echo "[*] Tạm stop watchdog trong khi re-login..."
-  systemctl stop "$WATCHDOG_SERVICE" 2>/dev/null || true
+  svc_stop "$WATCHDOG_SERVICE"
 
   # check_and_login: nếu đã login rồi → bỏ qua, không login lại
   if check_and_login "$email" "$password"; then
@@ -622,12 +750,12 @@ relogin_node() {
   fi
 
   echo "[*] Khởi động lại watchdog..."
-  systemctl start "$WATCHDOG_SERVICE" 2>/dev/null || true
+  svc_start "$WATCHDOG_SERVICE"
   echo
 }
 
 # ============================================================
-# WATCHDOG (v1.1.19)
+# WATCHDOG (v1.1.20)
 # Kiến trúc: Type=simple + while true (từ v1.1.4)
 # Phương án A: chỉ check auth khi node DOWN (không gọi mỗi 60s)
 # Phương án A: check auth khi node DOWN + do_login không --force
@@ -636,7 +764,7 @@ relogin_node() {
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.19
+# OptimAI Watchdog v1.1.20
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -690,7 +818,7 @@ trap '
   code=$?
   set +e
   if [[ $code -ne 0 ]]; then
-    send_telegram "<b>🔴 Watchdog Chết Bất Ngờ</b>%0A'"$SERVER_INFO"'%0AExit: ${code}%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")%0AKiểm tra: journalctl -u optimai-watchdog.service -n 50"
+    send_telegram "<b>🔴 Watchdog Chết Bất Ngờ</b>%0A'"$SERVER_INFO"'%0AExit: ${code}%0AThời gian: $(date "+%Y-%m-%d %H:%M:%S")%0AKiểm tra: tail -50 /var/log/optimai-watchdog.log"
     log "DIE exit_code=$code"
   fi
   exit $code
@@ -931,9 +1059,11 @@ WATCHDOG_EOF
 }
 
 create_watchdog_service() {
-  cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
+  case "$INIT_SYSTEM" in
+    systemd)
+      cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.19 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.20 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -949,8 +1079,68 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
+      svc_reload
+      ;;
 
-  systemctl daemon-reload
+    runit)
+      mkdir -p "$WATCHDOG_RUNIT"
+      cat <<EOF > "${WATCHDOG_RUNIT}/run"
+#!/bin/sh
+exec $WATCHDOG_SCRIPT
+EOF
+      chmod +x "${WATCHDOG_RUNIT}/run"
+      ;;
+
+    *)
+      # SysVinit — Devuan mặc định
+      cat <<EOF > "$WATCHDOG_INITD"
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          optimai-watchdog
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: OptimAI Watchdog v1.1.20
+### END INIT INFO
+
+DAEMON=$WATCHDOG_SCRIPT
+PIDFILE=/var/run/optimai-watchdog.pid
+NAME=optimai-watchdog
+
+case "\$1" in
+  start)
+    echo "Starting \$NAME..."
+    start-stop-daemon --start --background --make-pidfile \\
+      --pidfile "\$PIDFILE" --exec "\$DAEMON"
+    ;;
+  stop)
+    echo "Stopping \$NAME..."
+    start-stop-daemon --stop --pidfile "\$PIDFILE" --retry 10
+    rm -f "\$PIDFILE"
+    ;;
+  restart)
+    \$0 stop
+    sleep 2
+    \$0 start
+    ;;
+  status)
+    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+      echo "\$NAME is running (PID \$(cat \$PIDFILE))"
+    else
+      echo "\$NAME is not running"
+    fi
+    ;;
+  *)
+    echo "Usage: \$0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+exit 0
+EOF
+      chmod +x "$WATCHDOG_INITD"
+      ;;
+  esac
 }
 
 # ============================================================
@@ -961,9 +1151,9 @@ start_watchdog() {
   echo "=== (5) Start Watchdog Service ==="
   create_watchdog_script
   create_watchdog_service
-  systemctl enable --now "$WATCHDOG_SERVICE"
+  svc_enable "$WATCHDOG_SERVICE"
   echo "[✓] Watchdog đã start và enable."
-  echo "    Xem log live  : journalctl -u $WATCHDOG_SERVICE -f"
+  echo "    Xem log live  : $(svc_log_cmd "$WATCHDOG_SERVICE")"
   echo "    Xem log file  : tail -f /var/log/optimai-watchdog.log"
   send_telegram "<b>🛡️ Watchdog Đã Start</b>%0A${SERVER_INFO}%0AKiểm tra node + auth mỗi 60 giây.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
@@ -971,8 +1161,8 @@ start_watchdog() {
 
 stop_watchdog() {
   echo "=== (6) Stop Watchdog Service ==="
-  systemctl stop    "$WATCHDOG_SERVICE" 2>/dev/null || true
-  systemctl disable "$WATCHDOG_SERVICE" 2>/dev/null || true
+  svc_stop    "$WATCHDOG_SERVICE"
+  svc_disable "$WATCHDOG_SERVICE"
   echo "[✓] Watchdog đã stop & disable."
   send_telegram "<b>🛑 Watchdog Đã Stop</b>%0A${SERVER_INFO}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
@@ -980,7 +1170,9 @@ stop_watchdog() {
 
 status_watchdog() {
   echo "=== (7) Status Watchdog Service ==="
-  systemctl status "$WATCHDOG_SERVICE" --no-pager || true
+  echo "[i] Init system: $INIT_SYSTEM"
+  echo
+  svc_status "$WATCHDOG_SERVICE"
   echo
   # Hiện thị auth status hiện tại
   echo "--- Auth status hiện tại ---"
@@ -1002,17 +1194,21 @@ status_watchdog() {
     echo "(chưa có log)"
   fi
   echo
-  echo "👉 Theo dõi live: journalctl -u $WATCHDOG_SERVICE -f"
+  echo "👉 Theo dõi live: $(svc_log_cmd "$WATCHDOG_SERVICE")"
   echo
 }
 
 uninstall_watchdog() {
   echo "=== (9) Uninstall Watchdog Service ==="
-  systemctl stop    "$WATCHDOG_SERVICE" 2>/dev/null || true
-  systemctl disable "$WATCHDOG_SERVICE" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$WATCHDOG_SERVICE"
+  svc_stop    "$WATCHDOG_SERVICE"
+  svc_disable "$WATCHDOG_SERVICE"
+  # Xóa service file tuỳ init system
+  case "$INIT_SYSTEM" in
+    systemd)  rm -f "/etc/systemd/system/$WATCHDOG_SERVICE" ; svc_reload ;;
+    runit)    rm -rf "$WATCHDOG_RUNIT" ;;
+    *)        rm -f "$WATCHDOG_INITD" ;;
+  esac
   rm -f "$WATCHDOG_SCRIPT"
-  systemctl daemon-reload
   echo "[✓] Đã uninstall watchdog."
   send_telegram "<b>🧹 Watchdog Đã Uninstall</b>%0A${SERVER_INFO}%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
@@ -1105,7 +1301,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.19"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.20"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
