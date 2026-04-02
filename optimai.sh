@@ -4,9 +4,17 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.20
+# Version: 1.1.21
 #
 # Updates:
+# v1.1.21:
+#   - Tối ưu OS Repo cài Docker: Hỗ trợ tự detect đầy đủ Debian/Devuan.
+#   - Tối ưu ổ cứng (Log): Tự động xoay vòng file log (rotate) khi vượt quá 10MB.
+#   - Watchdog Zero Downtime: Sử dụng tail --pid theo dõi tiến trình chạy ngầm qua sự kiện tmux, phản ứng lập tức khi node crash (thay vì sleep mù).
+#   - Deadlock Recovery: Triệt để phá huỷ tiến trình node bị treo và cắt gọn tmux session chết cứng trước khi restart (bằng pkill -9).
+#   - Auto-prune Storage: Thêm chức năng cảnh báo dọn dẹp Docker storage nếu ổ gốc nhỏ hơn 10GB.
+#   - Preload Latest Image: Trải nghiệm phiên bản node engine ổn định nhất (crawl4ai:latest).
+#
 # v1.1.20:
 #   - Hỗ trợ Devuan (SysVinit) song song với Debian/Ubuntu (systemd)
 #   - Thêm detect_init(): tự động nhận diện init system khi khởi động
@@ -449,12 +457,14 @@ install_docker_if_needed() {
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  local os_id
+  os_id=$(. /etc/os-release && echo "$ID")
+  curl -fsSL "https://download.docker.com/linux/${os_id}/gpg" \
     | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo \
     "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu \
+https://download.docker.com/linux/${os_id} \
 $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
     | tee /etc/apt/sources.list.d/docker.list >/dev/null
   apt-get update -y
@@ -467,15 +477,29 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
 install_expect_if_needed() {
   if command -v expect >/dev/null 2>&1; then return 0; fi
   echo "[*] Cài expect..."
+  apt-get update -y -qq >/dev/null 2>&1 || true
   apt-get install -y expect -qq >/dev/null 2>&1
   echo "[✓] expect đã cài."
 }
 
-prefetch_crawler_image() {
-  if command -v docker >/dev/null 2>&1; then
-    echo "[*] Prefetch image crawl4ai..."
-    docker pull unclecode/crawl4ai:0.7.3 >/dev/null 2>&1 || true
+prefetch_and_prune_image() {
+  if ! command -v docker >/dev/null 2>&1; then return 0; fi
+
+  echo "[*] Kiểm tra dung lượng ổ đĩa..."
+  local free_kb yn
+  free_kb=$(df -k / | awk 'NR==2 {print $4}')
+  # Tốc độ đọc Disk Block trong cấu trúc UNIX (10485760 KB = 10GB)
+  if [[ "$free_kb" -lt 10485760 ]]; then
+    echo "[!] Cảnh báo: Ổ cứng gốc ( / ) còn trống dưới 10GB."
+    read -r -p "[?] Bạn có muốn dọn dẹp các Image Docker cũ để giải phóng không gian không? [y/N]: " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+      echo "[*] Đang xóa các Docker image cũ..."
+      docker image prune -a -f
+    fi
   fi
+
+  echo "[*] Prefetch image crawl4ai:latest..."
+  docker pull unclecode/crawl4ai:latest >/dev/null 2>&1 || true
 }
 
 # ============================================================
@@ -650,9 +674,12 @@ start_node_in_tmux() {
 
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     echo "[*] Kill session cũ '$TMUX_SESSION' để start lại sạch..."
-    tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
-    sleep 1
+    timeout 5 tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
   fi
+  
+  # Dọn dẹp triệt để phòng trường hợp Zombie Process treo hệ thống
+  pkill -9 -f "${CLI_PATH} node start" >/dev/null 2>&1 || true
+  sleep 1
 
   echo "[*] Đang start node trong tmux session '$TMUX_SESSION'..."
   tmux new-session -d -s "$TMUX_SESSION" "bash -lc '${CLI_PATH} node start'"
@@ -777,14 +804,24 @@ BLOCK_STATE="/tmp/optimai-blocked.state"
 
 MAX_RESTARTS=4    # Số restart tối đa trong WINDOW giây
 WINDOW=600        # 10 phút
-SLEEP_INTERVAL=60
+SLEEP_INTERVAL=15
 
 # ============================================================
 # UTILS
 # ============================================================
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
-log() { echo "$(ts) [watchdog] $*" | tee -a "$RESTART_LOG"; }
+log() {
+  echo "$(ts) [watchdog] $*" | tee -a "$RESTART_LOG"
+  # Rotate log nếu kích thước tiệm cận 10MB
+  if [[ -f "$RESTART_LOG" ]]; then
+    local size
+    size=$(stat -c%s "$RESTART_LOG" 2>/dev/null || echo 0)
+    if [[ "$size" -gt 10485760 ]]; then
+      mv "$RESTART_LOG" "${RESTART_LOG}.1" 2>/dev/null || true
+    fi
+  fi
+}
 
 # ---- Load Telegram config ----
 if [[ -f "$TELEGRAM_CONFIG" ]]; then
@@ -951,12 +988,18 @@ while true; do
 
   # ----------------------------------------------------------
   # BƯỚC 1: Kiểm tra node có đang chạy không
-  # (Phương án A: KHÔNG check auth mỗi chu kỳ — giảm tải server)
+  # Sử dụng tail --pid theo dõi tiến trình (event-driven, zero downtime)
   # ----------------------------------------------------------
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    log "NODE: OK - tmux session '$TMUX_SESSION' alive"
-    log "=== CHECK END - sleep ${SLEEP_INTERVAL}s ==="
-    sleep "$SLEEP_INTERVAL"
+    tmux_pid=$(tmux display-message -t "$TMUX_SESSION" -p '#{pane_pid}' 2>/dev/null || echo "")
+    if [[ -n "$tmux_pid" ]] && kill -0 "$tmux_pid" 2>/dev/null; then
+      log "NODE: OK - tmux session alive (PID: $tmux_pid). Theo dõi thụ động..."
+      tail --pid="$tmux_pid" -f /dev/null
+      log "NODE: Tiến trình tmux báo tử/kết thúc. Kích hoạt cứu hộ!"
+    else
+      log "NODE: tmux báo alive nhưng lỗi gắn process. Chờ dự phòng ${SLEEP_INTERVAL}s..."
+      sleep "$SLEEP_INTERVAL"
+    fi
     continue
   fi
 
@@ -1031,6 +1074,12 @@ while true; do
   echo "$local_now" >> "$RESTART_LOG"
   send_telegram "<b>🟠 Node DOWN - Đang Restart ($((count + 1))/${MAX_RESTARTS})</b>%0A${SERVER_INFO}%0AThời gian: $(ts)"
   log "NODE: Restart lần $((count + 1))/${MAX_RESTARTS}..."
+
+  # Ép dọn dẹp các session bị treo (deadlock)
+  log "NODE: Tiến hành dọn dẹp sạch môi trường chết ngầm trước khi start..."
+  timeout 5 tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
+  pkill -9 -f "${CLI_PATH} node start" >/dev/null 2>&1 || true
+  sleep 1
 
   tmux new-session -d -s "$TMUX_SESSION" "bash -lc '${CLI_PATH} node start'" 2>/dev/null
   restart_exit=$?
@@ -1248,7 +1297,7 @@ install_first_time() {
   ensure_cli
   install_docker_if_needed
   install_tmux_if_needed
-  prefetch_crawler_image
+  prefetch_and_prune_image
 
   local email password
   resolve_credentials email password
