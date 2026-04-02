@@ -4,9 +4,12 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.26
+# Version: 1.1.27
 #
 # Updates:
+# v1.1.27:
+#   - Hủy bỏ giới hạn luồng Docker `max-concurrent-downloads` do trình giải nén `unpigz` lõi của Docker mặc định vẫn sẽ bung đa luồng ăn 100% CPU.
+#
 # v1.1.26:
 #   - Tối ưu Docker Threading Core: Bổ sung thuật toán chặn sập VPS do Docker giải nén đa luồng bằng cách giới hạn max-concurrent-downloads thông qua JQ, có Validation Loop.
 #
@@ -267,7 +270,7 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.26)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.27)"
   echo "============================================================"
   echo
 }
@@ -489,58 +492,6 @@ $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
     docker-buildx-plugin docker-compose-plugin
   svc_enable "docker"
   echo "[✓] Docker đã cài."
-}
-
-optimize_docker_threading() {
-  local daemon_file="/etc/docker/daemon.json"
-  
-  if [ -f "$daemon_file" ] && grep -q '"max-concurrent-downloads"' "$daemon_file"; then
-    return 0
-  fi
-
-  echo
-  echo "[!] Để tránh lỗi sập/treo VPS (đặc biệt các máy có RAM <= 2GB, CPU yếu) do Docker bung nén layer quá nặng,"
-  echo "    bạn nên giới hạn số luồng xử lý đồng thời của hệ thống Docker."
-  echo "    (Lưu ý: Thao tác này sẽ khởi động lại dịch vụ Docker khi hoàn tất)"
-  
-  local want_thread=""
-  while true; do
-    read -r -p "[?] Nhập số luồng giới hạn (1-9) [Nhấn Enter mặc định dùng 1 luồng]: " want_thread
-    if [[ -z "$want_thread" ]]; then
-      want_thread=1
-      break
-    fi
-    if [[ "$want_thread" =~ ^[1-9]$ ]]; then
-      break
-    else
-      echo "  [!] Lỗi định dạng: Vui lòng chỉ nhập 1 ký tự số từ 1 đến 9."
-    fi
-  done
-
-  echo "[*] Đang cấu hình Docker giới hạn ở mức $want_thread luồng tải/bung nén..."
-  apt-get install -y jq -qq >/dev/null 2>&1 || true
-  
-  if [ ! -f "$daemon_file" ]; then
-    echo '{' > "$daemon_file"
-    echo "  \"max-concurrent-downloads\": $want_thread," >> "$daemon_file"
-    echo "  \"max-concurrent-uploads\": $want_thread" >> "$daemon_file"
-    echo '}' >> "$daemon_file"
-  else
-    if command -v jq >/dev/null 2>&1; then
-      jq ". + {\"max-concurrent-downloads\": $want_thread, \"max-concurrent-uploads\": $want_thread}" "$daemon_file" > "${daemon_file}.tmp" && mv "${daemon_file}.tmp" "$daemon_file"
-    else
-      echo "  [!] Không tìm thấy công cụ lệnh 'jq', công cụ sẽ tạo daemon.json mới an toàn."
-      echo '{' > "$daemon_file"
-      echo "  \"max-concurrent-downloads\": $want_thread," >> "$daemon_file"
-      echo "  \"max-concurrent-uploads\": $want_thread" >> "$daemon_file"
-      echo '}' >> "$daemon_file"
-    fi
-  fi
-
-  echo "[*] Tái khởi động (Restarting) Docker service..."
-  systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null || true
-  echo "  -> Đã chốt luồng tải Docker thành công ở mức $want_thread!"
-  sleep 2
 }
 
 install_expect_if_needed() {
@@ -1427,7 +1378,6 @@ install_first_time() {
   echo "=== (1) Cài node lần đầu ==="
   ensure_cli
   install_docker_if_needed
-  optimize_docker_threading
   install_tmux_if_needed
   interactive_prepull
 
@@ -1482,7 +1432,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.26"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.27"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1515,7 +1465,7 @@ while true; do
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.26) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.27) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
