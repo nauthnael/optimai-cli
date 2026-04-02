@@ -4,9 +4,12 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.21
+# Version: 1.1.22
 #
 # Updates:
+# v1.1.22:
+#   - Tự động quét dọn rác thư mục /tmp/_MEI* do ứng dụng rò rỉ khi crash/kill.
+#
 # v1.1.21:
 #   - Tối ưu OS Repo cài Docker: Hỗ trợ tự detect đầy đủ Debian/Devuan.
 #   - Tối ưu ổ cứng (Log): Tự động xoay vòng file log (rotate) khi vượt quá 10MB.
@@ -679,6 +682,9 @@ start_node_in_tmux() {
   
   # Dọn dẹp triệt để phòng trường hợp Zombie Process treo hệ thống
   pkill -9 -f "${CLI_PATH} node start" >/dev/null 2>&1 || true
+  
+  # Giải phóng file rác tạm của PyInstaller tránh full /tmp Disk
+  rm -rf /tmp/_MEI* >/dev/null 2>&1 || true
   sleep 1
 
   echo "[*] Đang start node trong tmux session '$TMUX_SESSION'..."
@@ -1079,6 +1085,9 @@ while true; do
   log "NODE: Tiến hành dọn dẹp sạch môi trường chết ngầm trước khi start..."
   timeout 5 tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
   pkill -9 -f "${CLI_PATH} node start" >/dev/null 2>&1 || true
+  
+  # Xoá dứt điểm thư mục giải nén rác của PyInstaller /tmp/_MEI...
+  rm -rf /tmp/_MEI* >/dev/null 2>&1 || true
   sleep 1
 
   tmux new-session -d -s "$TMUX_SESSION" "bash -lc '${CLI_PATH} node start'" 2>/dev/null
@@ -1350,7 +1359,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.20"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.22"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1381,6 +1390,16 @@ while true; do
     11) relogin_node ;;
     12) configure_credentials ;;
     0)
+      echo
+      echo "============================================================"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.22) !"
+      echo "✨ Các thay đổi mới nhất:"
+      echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
+      echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
+      echo "   - Dọn dẹp rác /tmp/_MEI* triệt để sau crash"
+      echo "   - Auto-prune Docker & Log Rotate chống tràn"
+      echo "👉 Kết nối với mình tại X/Twitter: https://x.com/tuangg"
+      echo "============================================================"
       echo "Bye! 👋"
       exit 0
       ;;
