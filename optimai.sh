@@ -4,9 +4,12 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.22
+# Version: 1.1.23
 #
 # Updates:
+# v1.1.23:
+#   - Tự động Xoá Containers/Images cũ: Dọn dẹp phiên bản Docker trùng lặp (multi-versions) và gỡ rác image cũ 0.7.3 khi update lên 0.7.8+ giúp giảm RAM và Disk.
+#
 # v1.1.22:
 #   - Tự động quét dọn rác thư mục /tmp/_MEI* do ứng dụng rò rỉ khi crash/kill.
 #
@@ -685,6 +688,22 @@ start_node_in_tmux() {
   
   # Giải phóng file rác tạm của PyInstaller tránh full /tmp Disk
   rm -rf /tmp/_MEI* >/dev/null 2>&1 || true
+  
+  # Dọn dẹp Docker container và Image bản cũ thông minh (Smart Version-aware Prune)
+  if command -v docker >/dev/null 2>&1; then
+    local tags old_tags old_containers t
+    tags=$(docker images --format '{{.Tag}}' unclecode/crawl4ai 2>/dev/null | grep -v 'latest' | sort -V | uniq || true)
+    if [ $(echo "$tags" | wc -w) -gt 1 ]; then
+      old_tags=$(echo "$tags" | head -n -1)
+      for t in $old_tags; do
+        old_containers=$(docker ps -a -q --filter ancestor="unclecode/crawl4ai:$t" 2>/dev/null || true)
+        if [ -n "$old_containers" ]; then
+            docker rm -f $old_containers >/dev/null 2>&1 || true
+        fi
+        docker rmi "unclecode/crawl4ai:$t" >/dev/null 2>&1 || true
+      done
+    fi
+  fi
   sleep 1
 
   echo "[*] Đang start node trong tmux session '$TMUX_SESSION'..."
@@ -1088,6 +1107,21 @@ while true; do
   
   # Xoá dứt điểm thư mục giải nén rác của PyInstaller /tmp/_MEI...
   rm -rf /tmp/_MEI* >/dev/null 2>&1 || true
+  
+  # Dọn dẹp Docker container và Image bản cũ thông minh (Smart Version-aware Prune)
+  if command -v docker >/dev/null 2>&1; then
+    tags=$(docker images --format '{{.Tag}}' unclecode/crawl4ai 2>/dev/null | grep -v 'latest' | sort -V | uniq || true)
+    if [ $(echo "$tags" | wc -w) -gt 1 ]; then
+      old_tags=$(echo "$tags" | head -n -1)
+      for t in $old_tags; do
+        old_containers=$(docker ps -a -q --filter ancestor="unclecode/crawl4ai:$t" 2>/dev/null || true)
+        if [ -n "$old_containers" ]; then
+            docker rm -f $old_containers >/dev/null 2>&1 || true
+        fi
+        docker rmi "unclecode/crawl4ai:$t" >/dev/null 2>&1 || true
+      done
+    fi
+  fi
   sleep 1
 
   tmux new-session -d -s "$TMUX_SESSION" "bash -lc '${CLI_PATH} node start'" 2>/dev/null
@@ -1359,7 +1393,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.22"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.23"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1392,7 +1426,7 @@ while true; do
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.22) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.23) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
