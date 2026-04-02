@@ -256,7 +256,7 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.20)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.23)"
   echo "============================================================"
   echo
 }
