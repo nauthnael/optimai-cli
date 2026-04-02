@@ -4,9 +4,13 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.24
+# Version: 1.1.25
 #
 # Updates:
+# v1.1.25:
+#   - Khắc phục lỗi Timeout 600s: Bổ sung Interactive Pre-pull ở Menu 1. Tự động múc 100% dung lượng hệ thống để tải an toàn Image bản chuẩn.
+#   - Xóa rác Cận chiến (16GB RAM): Ở chế độ Setup lần đầu, thẳng tay huỷ duyệt `latest` và các version cũ, chỉ giữa duy nhất 1 bản đĩa đang cài đặt để giảm tải cực hạn.
+#
 # v1.1.24:
 #   - Sửa lỗi Menu 1 bị treo tải Image `latest` lãng phí băng thông: Để `optimai-cli` tự động quyết định tag version cần tải thay vì script tự block pre-pull kéo trùng lặp 2 lần.
 #   - Tối ưu xoá rác v2: Tách biệt logic ép tắt toàn bộ Container `crawl4ai` cũ và xoá bộ cài Image cũ để khắc phục lỗi xung đột 2 Container (7.3 và 7.8) chạy song song trên VPS.
@@ -260,7 +264,7 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.24)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.25)"
   echo "============================================================"
   echo
 }
@@ -492,21 +496,31 @@ install_expect_if_needed() {
   echo "[✓] expect đã cài."
 }
 
-check_disk_and_prune() {
+interactive_prepull() {
   if ! command -v docker >/dev/null 2>&1; then return 0; fi
 
-  echo "[*] Kiểm tra dung lượng ổ đĩa..."
-  local free_kb yn
-  free_kb=$(df -k / | awk 'NR==2 {print $4}')
-  # Tốc độ đọc Disk Block trong cấu trúc UNIX (10485760 KB = 10GB)
-  if [[ "$free_kb" -lt 10485760 ]]; then
-    echo "[!] Cảnh báo: Ổ cứng gốc ( / ) còn trống dưới 10GB."
-    read -r -p "[?] Bạn có muốn dọn dẹp các Image Docker rác để giải phóng không gian không? [y/N]: " yn
-    if [[ "$yn" =~ ^[Yy]$ ]]; then
-      echo "[*] Đang xóa các Docker image cũ..."
-      docker image prune -a -f
+  echo "[*] Để tránh lỗi Timeout 600s của OptimAI CLI trên VPS mạng yếu,"
+  echo "    hệ thống sẽ tiền tải (pre-pull) Image Node trước khi bắt đầu."
+  local user_tag
+  read -r -p "[?] Nhập phiên bản Image cần tải (Nhấn Enter mặc định dùng '0.7.8'): " user_tag
+  user_tag="${user_tag:-0.7.8}"
+
+  echo "[*] Vệ sinh vùng nhớ RAM & tắt Container đụng độ..."
+  docker rm -f $(docker ps -aq --filter "name=optimai_crawl4ai" 2>/dev/null) >/dev/null 2>&1 || true
+
+  echo "[*] Dọn dẹp ổ đĩa siêu gắt (Chỉ cố thủ giữ lại bản $user_tag)..."
+  local tags t
+  tags=$(docker images --format '{{.Tag}}' unclecode/crawl4ai 2>/dev/null | grep -v "^${user_tag}$" || true)
+  
+  for t in $tags; do
+    if [ -n "$t" ]; then
+      echo "  - Gỡ bỏ Image cũ chiếm không gian: unclecode/crawl4ai:$t"
+      docker rmi "unclecode/crawl4ai:$t" >/dev/null 2>&1 || true
     fi
-  fi
+  done
+
+  echo "[*] Tiến hành kéo dữ liệu Node không giới hạn thời gian (pulling unclecode/crawl4ai:$user_tag) ..."
+  docker pull "unclecode/crawl4ai:$user_tag"
 }
 
 # ============================================================
@@ -1339,7 +1353,7 @@ install_first_time() {
   ensure_cli
   install_docker_if_needed
   install_tmux_if_needed
-  check_disk_and_prune
+  interactive_prepull
 
   local email password
   resolve_credentials email password
@@ -1392,7 +1406,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.24"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.25"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1425,7 +1439,7 @@ while true; do
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.24) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.25) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
