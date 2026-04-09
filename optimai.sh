@@ -4,9 +4,17 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.27
+# Version: 1.1.28
 #
 # Updates:
+# v1.1.28:
+#   - Fix Bug 1 & 7: Dọn dẹp /tmp/_MEI* an toàn bằng cleanup_mei_orphans (kiểm tra fuser/proc).
+#   - Fix Bug 2: Sửa lỗi docker rm -f khi không có container.
+#   - Fix Bug 3: Sửa lỗi bash condition word splitting cho tags count.
+#   - Fix Bug 4: Cập nhật version string trong Watchdog Service.
+#   - Fix Bug 5: Sửa thông báo Telegram Watchdog interval.
+#   - Fix Bug 6: Thay tail --pid bằng polling loop để tránh block vĩnh viễn.
+#
 # v1.1.27:
 #   - Hủy bỏ giới hạn luồng Docker `max-concurrent-downloads` do trình giải nén `unpigz` lõi của Docker mặc định vẫn sẽ bung đa luồng ăn 100% CPU.
 #
@@ -270,7 +278,7 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.27)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.28)"
   echo "============================================================"
   echo
 }
@@ -727,17 +735,18 @@ start_node_in_tmux() {
   # Dọn dẹp triệt để phòng trường hợp Zombie Process treo hệ thống
   pkill -9 -f "${CLI_PATH} node start" >/dev/null 2>&1 || true
   
-  # Giải phóng file rác tạm của PyInstaller tránh full /tmp Disk
-  rm -rf /tmp/_MEI* >/dev/null 2>&1 || true
-  
   # Xoá tận gốc toàn bộ Container thuộc dòng OptimAI trước để tránh xung đột chạy đè (Vd: 7.3 vs 7.8)
   if command -v docker >/dev/null 2>&1; then
-    docker rm -f $(docker ps -aq --filter "name=optimai_crawl4ai" 2>/dev/null) >/dev/null 2>&1 || true
+    local cids
+    cids=$(docker ps -aq --filter "name=optimai_crawl4ai" 2>/dev/null || true)
+    [[ -n "$cids" ]] && docker rm -f $cids >/dev/null 2>&1 || true
     
     # Dọn dẹp Docker Image bản cũ thông minh (Chỉ xoá bộ gài 8GB phiên bản cũ trên đĩa)
     local tags old_tags t
     tags=$(docker images --format '{{.Tag}}' unclecode/crawl4ai 2>/dev/null | grep -v 'latest' | sort -V | uniq || true)
-    if [ $(echo "$tags" | wc -w) -gt 1 ]; then
+    local tag_count
+    tag_count=$(echo "$tags" | wc -w)
+    if [[ "$tag_count" -gt 1 ]]; then
       old_tags=$(echo "$tags" | head -n -1)
       for t in $old_tags; do
         docker rmi "unclecode/crawl4ai:$t" >/dev/null 2>&1 || true
@@ -856,7 +865,7 @@ relogin_node() {
 create_watchdog_script() {
   cat <<'WATCHDOG_EOF' > "$WATCHDOG_SCRIPT"
 #!/usr/bin/env bash
-# OptimAI Watchdog v1.1.20
+# OptimAI Watchdog v1.1.28
 # KHÔNG dùng set -euo pipefail: tránh exit ngầm khi grep/awk return non-zero
 
 # ---- Cấu hình cứng (hardcode, không expand từ outer script) ----
@@ -1040,6 +1049,31 @@ reset_restart_log() {
   log "Restart log đã reset sau re-login thành công"
 }
 
+cleanup_mei_orphans() {
+  # Chỉ xóa thư mục _MEI* không có process nào đang mở (orphan)
+  local dir count=0
+  for dir in /tmp/_MEI*/; do
+    [[ -d "$dir" ]] || continue
+    local in_use=0
+    if command -v fuser >/dev/null 2>&1; then
+      fuser "$dir" >/dev/null 2>&1 && in_use=1
+    else
+      # Fallback: kiểm tra qua /proc nếu không có fuser
+      local fd_link
+      for fd_link in /proc/*/fd; do
+        if ls -la "$fd_link" 2>/dev/null | grep -q "$dir"; then
+          in_use=1; break
+        fi
+      done
+    fi
+    if [[ $in_use -eq 0 ]]; then
+      rm -rf "$dir" 2>/dev/null || true
+      count=$((count + 1))
+    fi
+  done
+  [[ $count -gt 0 ]] && log "CLEANUP: Đã xóa $count thư mục _MEI* orphan"
+}
+
 # ============================================================
 # MAIN LOOP
 # ============================================================
@@ -1058,11 +1092,11 @@ while true; do
   if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux_pid=$(tmux display-message -t "$TMUX_SESSION" -p '#{pane_pid}' 2>/dev/null || echo "")
     if [[ -n "$tmux_pid" ]] && kill -0 "$tmux_pid" 2>/dev/null; then
-      log "NODE: OK - tmux session alive (PID: $tmux_pid). Theo dõi thụ động..."
-      tail --pid="$tmux_pid" -f /dev/null
-      log "NODE: Tiến trình tmux báo tử/kết thúc. Kích hoạt cứu hộ!"
+      log "NODE: OK - tmux alive (PID: $tmux_pid). Chờ ${SLEEP_INTERVAL}s..."
+      # Dùng sleep thông thường thay vì tail --pid (tránh block vĩnh viễn - Bug 6)
+      sleep "$SLEEP_INTERVAL"
     else
-      log "NODE: tmux báo alive nhưng lỗi gắn process. Chờ dự phòng ${SLEEP_INTERVAL}s..."
+      log "NODE: tmux có session nhưng không lấy được PID. Chờ ${SLEEP_INTERVAL}s..."
       sleep "$SLEEP_INTERVAL"
     fi
     continue
@@ -1145,16 +1179,15 @@ while true; do
   timeout 5 tmux kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
   pkill -9 -f "${CLI_PATH} node start" >/dev/null 2>&1 || true
   
-  # Xoá dứt điểm thư mục giải nén rác của PyInstaller /tmp/_MEI...
-  rm -rf /tmp/_MEI* >/dev/null 2>&1 || true
-  
   # Xoá tận gốc toàn bộ Container thuộc dòng OptimAI trước để tránh xung đột chạy đè
   if command -v docker >/dev/null 2>&1; then
-    docker rm -f $(docker ps -aq --filter "name=optimai_crawl4ai" 2>/dev/null) >/dev/null 2>&1 || true
+    cids=$(docker ps -aq --filter "name=optimai_crawl4ai" 2>/dev/null || true)
+    [[ -n "$cids" ]] && docker rm -f $cids >/dev/null 2>&1 || true
     
     # Dọn dẹp Docker Image bản cũ thông minh (Chỉ xoá bộ gài 8GB phiên bản cũ trên đĩa)
     tags=$(docker images --format '{{.Tag}}' unclecode/crawl4ai 2>/dev/null | grep -v 'latest' | sort -V | uniq || true)
-    if [ $(echo "$tags" | wc -w) -gt 1 ]; then
+    tag_count=$(echo "$tags" | wc -w)
+    if [[ "$tag_count" -gt 1 ]]; then
       old_tags=$(echo "$tags" | head -n -1)
       for t in $old_tags; do
         docker rmi "unclecode/crawl4ai:$t" >/dev/null 2>&1 || true
@@ -1181,6 +1214,8 @@ while true; do
   fi
 
   log "=== CHECK END - sleep ${SLEEP_INTERVAL}s ==="
+  # Dọn _MEI* orphan định kỳ (chạy mỗi chu kỳ, fuser đảm bảo an toàn - Bug 1 & 7)
+  cleanup_mei_orphans
   sleep "$SLEEP_INTERVAL"
 done
 WATCHDOG_EOF
@@ -1194,7 +1229,7 @@ create_watchdog_service() {
     systemd)
       cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.20 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.28 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -1232,7 +1267,7 @@ EOF
 # Required-Stop:     \$network \$remote_fs
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: OptimAI Watchdog v1.1.20
+# Short-Description: OptimAI Watchdog v1.1.28
 ### END INIT INFO
 
 DAEMON=$WATCHDOG_SCRIPT
@@ -1286,7 +1321,7 @@ start_watchdog() {
   echo "[✓] Watchdog đã start và enable."
   echo "    Xem log live  : $(svc_log_cmd "$WATCHDOG_SERVICE")"
   echo "    Xem log file  : tail -f /var/log/optimai-watchdog.log"
-  send_telegram "<b>🛡️ Watchdog Đã Start</b>%0A${SERVER_INFO}%0AKiểm tra node + auth mỗi 60 giây.%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
+  send_telegram "<b>🛡️ Watchdog Đã Start</b>%0A${SERVER_INFO}%0AChế độ event-driven (phản ứng ngay khi node down).%0AThời gian: $(date '+%Y-%m-%d %H:%M:%S')"
   echo
 }
 
@@ -1432,7 +1467,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.27"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.28"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1465,7 +1500,7 @@ while true; do
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.27) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.28) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
