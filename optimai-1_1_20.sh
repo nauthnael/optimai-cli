@@ -4,9 +4,12 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.28
+# Version: 1.1.29
 #
 # Updates:
+# v1.1.29:
+#   - Tối ưu dọn dẹp /tmp/_MEI*: Thay thế logic fuser bằng "giữ 2 bản mới nhất" để tránh crash node (PyInstaller đóng fd sau khi load xong nhưng vẫn cần file).
+#
 # v1.1.28:
 #   - Fix Bug 1 & 7: Dọn dẹp /tmp/_MEI* an toàn bằng cleanup_mei_orphans (kiểm tra fuser/proc).
 #   - Fix Bug 2: Sửa lỗi docker rm -f khi không có container.
@@ -278,7 +281,7 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.28)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.29)"
   echo "============================================================"
   echo
 }
@@ -1050,28 +1053,22 @@ reset_restart_log() {
 }
 
 cleanup_mei_orphans() {
-  # Chỉ xóa thư mục _MEI* không có process nào đang mở (orphan)
-  local dir count=0
-  for dir in /tmp/_MEI*/; do
+  # Giữ lại 2 thư mục _MEI* mới nhất, xóa tất cả thư mục cũ hơn
+  # Lý do giữ 2: an toàn trong khoảng overlap khi restart
+  # Không dùng fuser/proc vì PyInstaller đóng fd sau dlopen → không detect được
+  local dirs dir_count deleted=0
+  dirs=$(ls -dt /tmp/_MEI*/ 2>/dev/null || true)
+  dir_count=$(echo "$dirs" | grep -c '_MEI' 2>/dev/null || echo 0)
+
+  if [[ "$dir_count" -le 2 ]]; then
+    return 0
+  fi
+
+  echo "$dirs" | tail -n +3 | while IFS= read -r dir; do
     [[ -d "$dir" ]] || continue
-    local in_use=0
-    if command -v fuser >/dev/null 2>&1; then
-      fuser "$dir" >/dev/null 2>&1 && in_use=1
-    else
-      # Fallback: kiểm tra qua /proc nếu không có fuser
-      local fd_link
-      for fd_link in /proc/*/fd; do
-        if ls -la "$fd_link" 2>/dev/null | grep -q "$dir"; then
-          in_use=1; break
-        fi
-      done
-    fi
-    if [[ $in_use -eq 0 ]]; then
-      rm -rf "$dir" 2>/dev/null || true
-      count=$((count + 1))
-    fi
+    rm -rf "$dir" 2>/dev/null || true
+    log "CLEANUP: Đã xóa _MEI* cũ: $dir"
   done
-  [[ $count -gt 0 ]] && log "CLEANUP: Đã xóa $count thư mục _MEI* orphan"
 }
 
 # ============================================================
@@ -1099,6 +1096,7 @@ while true; do
       log "NODE: tmux có session nhưng không lấy được PID. Chờ ${SLEEP_INTERVAL}s..."
       sleep "$SLEEP_INTERVAL"
     fi
+    cleanup_mei_orphans
     continue
   fi
 
@@ -1195,6 +1193,7 @@ while true; do
     fi
   fi
   sleep 1
+  cleanup_mei_orphans
 
   tmux new-session -d -s "$TMUX_SESSION" "bash -lc '${CLI_PATH} node start'" 2>/dev/null
   restart_exit=$?
@@ -1214,8 +1213,6 @@ while true; do
   fi
 
   log "=== CHECK END - sleep ${SLEEP_INTERVAL}s ==="
-  # Dọn _MEI* orphan định kỳ (chạy mỗi chu kỳ, fuser đảm bảo an toàn - Bug 1 & 7)
-  cleanup_mei_orphans
   sleep "$SLEEP_INTERVAL"
 done
 WATCHDOG_EOF
@@ -1229,7 +1226,7 @@ create_watchdog_service() {
     systemd)
       cat <<EOF > "/etc/systemd/system/$WATCHDOG_SERVICE"
 [Unit]
-Description=OptimAI Watchdog v1.1.28 - Tuangg (tmux: $TMUX_SESSION)
+Description=OptimAI Watchdog v1.1.29 - Tuangg (tmux: $TMUX_SESSION)
 After=network-online.target
 Wants=network-online.target
 
@@ -1267,7 +1264,7 @@ EOF
 # Required-Stop:     \$network \$remote_fs
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: OptimAI Watchdog v1.1.28
+# Short-Description: OptimAI Watchdog v1.1.29
 ### END INIT INFO
 
 DAEMON=$WATCHDOG_SCRIPT
@@ -1467,7 +1464,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.28"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.29"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1500,7 +1497,7 @@ while true; do
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.28) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.29) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
