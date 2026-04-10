@@ -4,9 +4,12 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.29
+# Version: 1.1.30
 #
 # Updates:
+# v1.1.30:
+#   - Fix lỗi không ghi đè watchdog mới khi đang chạy: Thêm svc_stop trước khi tạo script để đảm bảo process cũ dừng hẳn.
+#
 # v1.1.29:
 #   - Tối ưu dọn dẹp /tmp/_MEI*: Thay thế logic fuser bằng "giữ 2 bản mới nhất" để tránh crash node (PyInstaller đóng fd sau khi load xong nhưng vẫn cần file).
 #
@@ -281,7 +284,7 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.29)"
+  echo "        OptimAI CLI All in One - Tuangg (v1.1.30)"
   echo "============================================================"
   echo
 }
@@ -1312,6 +1315,9 @@ EOF
 
 start_watchdog() {
   echo "=== (5) Start Watchdog Service ==="
+  # Stop trước để đảm bảo process cũ dừng hẳn
+  # Script mới sẽ được load khi start lại sau đó
+  svc_stop "$WATCHDOG_SERVICE"
   create_watchdog_script
   create_watchdog_service
   svc_enable "$WATCHDOG_SERVICE"
@@ -1464,7 +1470,7 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.29"
+  echo "OptimAI CLI All in One - Tuangg - Version 1.1.30"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1497,7 +1503,7 @@ while true; do
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.29) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.30) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
