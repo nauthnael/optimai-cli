@@ -34,6 +34,7 @@
 | 📱 Thông báo Telegram | Cảnh báo đầy đủ: node down, restart, re-login, block, watchdog crash |
 | ⛔ Chống restart loop | Block tự động nếu restart quá 4 lần trong 10 phút |
 | 🔄 Deploy hàng loạt | Script riêng SSH vào 50 VPS song song, login + restart node tự động |
+| 🐳 Harden Docker | Bịt cổng API crawl4ai (0.0.0.0, không xác thực) đang bị bot quét để cài miner (XMRig) |
 
 ---
 
@@ -171,6 +172,35 @@ Dùng khi auth hết hạn và muốn login lại ngay mà không cần chờ wa
 Lưu email và password vào `/etc/optimai/credentials.conf` (chmod 600). Script test login ngay sau khi lưu để xác nhận thông tin đúng.
 
 > Đây là bước cần thiết để watchdog có thể **tự re-login** khi auth hết hạn.
+
+### Menu 13 — Harden Docker (chống hack container crawl4ai)
+
+**Vấn đề:** container `crawl4ai` mà OptimAI dùng publish API ra `0.0.0.0:11235` **không xác thực**. Bot quét Internet có thể gọi thẳng API này và thả miner (XMRig) vào container — VPS bị chiếm CPU mà không hề bị lộ mật khẩu hay SSH key.
+
+Menu 13 khoá lỗ hổng này ở **tầng host** (không đụng vào code OptimAI, vì code đó sẽ bị ghi đè mỗi lần update/reinstall):
+
+1. Xoá container `crawl4ai` hiện tại (nếu đã nhiễm)
+2. Ép Docker mặc định chỉ bind cổng publish vào `127.0.0.1` (sửa `/etc/docker/daemon.json`)
+3. Chặn cổng `11235` và `21731` đi vào từ WAN trong chain `DOCKER-USER` (firewalld hoặc iptables)
+4. Kéo lại image `crawl4ai` sạch từ upstream
+
+Có 2 chế độ:
+- **Dry-run** (mặc định) — chỉ in ra sẽ làm gì, không đổi gì
+- **Apply** — thực thi thật, sẽ **restart Docker** (node gián đoạn vài giây)
+
+> ⚠️ Lớp 1 (bind 127.0.0.1) áp dụng cho **mọi** container publish cổng mà không ghi rõ IP. Nếu VPS có container khác cần public thật sự, container đó phải khai báo `-p 0.0.0.0:PORT:PORT` rõ ràng.
+
+Sau khi apply, kiểm tra lại từ chính VPS:
+```bash
+docker ps --format '{{.Names}}  {{.Ports}}' | grep -i crawl4ai
+# -> phải thấy 127.0.0.1:11235->...  (KHÔNG được là 0.0.0.0)
+```
+
+Logic tương tự cũng có ở file độc lập [`harden-optimai.sh`](harden-optimai.sh), dùng khi muốn chạy riêng không qua menu:
+```bash
+sudo bash harden-optimai.sh          # DRY-RUN
+sudo bash harden-optimai.sh --apply  # Thực thi thật
+```
 
 ---
 
@@ -453,6 +483,7 @@ systemctl status optimai-watchdog.service
 
 | Version | Thay đổi chính |
 |---|---|
+| **v1.1.31** | Thêm Menu 13 "Harden Docker" — chống hack container crawl4ai (miner XMRig qua API 0.0.0.0 không xác thực) |
 | **v1.1.12** | Credentials bảo mật, watchdog auto re-login qua `auth status` |
 | **v1.1.11** | `auto_login` dùng expect, menu re-login thủ công |
 | **v1.1.10** | Watchdog kiến trúc `Type=simple + while true`, check node bằng `tmux has-session` |

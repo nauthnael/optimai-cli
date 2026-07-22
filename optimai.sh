@@ -4,9 +4,15 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 
 # ============================================================
 # OptimAI CLI All in One - Tuangg
-# Version: 1.1.30
+# Version: 1.1.31
 #
 # Updates:
+# v1.1.31:
+#   - Thêm Menu 13 "Harden Docker": chống hack container crawl4ai (miner XMRig qua API 0.0.0.0:11235 không xác thực).
+#     + Xoá container crawl4ai nhiễm, ép Docker daemon bind publish port vào 127.0.0.1,
+#       DROP cổng crawl4ai từ WAN trong chain DOCKER-USER (firewalld/iptables), kéo lại image sạch.
+#     + Có chế độ dry-run (mặc định) và apply (thực thi thật).
+#
 # v1.1.30:
 #   - Fix lỗi không ghi đè watchdog mới khi đang chạy: Thêm svc_stop trước khi tạo script để đảm bảo process cũ dừng hẳn.
 #
@@ -143,6 +149,9 @@ set +H  # Tắt history expansion: tránh lỗi "event not found" với ký tự
 # - Link tải CLI: https://cli-node.optimai.network/optimai_cli_ubuntu
 # - Login: optimai-cli auth login --legacy
 # ============================================================
+
+SCRIPT_VERSION="1.1.31"
+SCRIPT_UPDATED="2026-07-22"
 
 PROMO_TEXT=$'\n✨ Ae dùng script thấy ok thì follow mình để update bản mới nhé 👉 https://x.com/tuangg\n'
 
@@ -284,7 +293,8 @@ svc_log_cmd() {
 banner() {
   clear
   echo "============================================================"
-  echo "        OptimAI CLI All in One - Tuangg (v1.1.30)"
+  echo "        OptimAI CLI All in One - Tuangg"
+  echo "        Version ${SCRIPT_VERSION}  |  Cập nhật: ${SCRIPT_UPDATED}"
   echo "============================================================"
   echo
 }
@@ -1409,6 +1419,153 @@ EOF
 }
 
 # ============================================================
+# HARDEN DOCKER (chống hack container crawl4ai)
+# ============================================================
+# Nguyên nhân gốc: container crawl4ai của OptimAI publish API ra 0.0.0.0:11235
+# (không xác thực) -> bot Internet gọi API -> thả miner (XMRig) vào container.
+# Hàm này KHÔNG sửa OptimAI (sẽ bị ghi đè khi cài lại). Nó khoá ở tầng HOST:
+#   Bước 1: Xoá container crawl4ai hiện tại (nếu đã nhiễm)
+#   Bước 2: Docker mặc định bind cổng publish vào 127.0.0.1 (/etc/docker/daemon.json)
+#   Bước 3: DROP cổng crawl4ai từ WAN trong chain DOCKER-USER (firewalld/iptables)
+#   Bước 4: Kéo lại image crawl4ai sạch từ upstream
+
+harden_docker_crawl4ai() {
+  echo "=== (13) Harden Docker — Chống hack container crawl4ai ==="
+  echo "Container crawl4ai publish API ra 0.0.0.0 (không xác thực)."
+  echo "Bot quét Internet có thể gọi API này và thả miner (XMRig) vào container."
+  echo
+  echo "Sẽ thực hiện:"
+  echo "  1) Xoá container crawl4ai hiện tại (nếu đã nhiễm)"
+  echo "  2) Ép Docker mặc định chỉ bind cổng publish vào 127.0.0.1"
+  echo "  3) Chặn cổng crawl4ai (11235, 21731) từ WAN bằng firewalld/iptables"
+  echo "  4) Kéo lại image crawl4ai sạch từ upstream"
+  echo
+  echo "1) Dry-run (chỉ xem trước, KHÔNG đổi gì)"
+  echo "2) Apply  (thực thi thật — sẽ restart Docker, node gián đoạn vài giây)"
+  read -r -p "Chọn [1-2, Enter=huỷ]: " hchoice
+
+  local apply=0
+  case "$hchoice" in
+    1) apply=0 ;;
+    2) apply=1 ;;
+    *) echo "[i] Đã huỷ."; return ;;
+  esac
+
+  local ports=(11235 21731)
+  local wan_if backup_dir
+  wan_if="$(ip -o route show default 2>/dev/null | awk '{print $5; exit}')"
+  [[ -z "$wan_if" ]] && wan_if="eth0"
+  backup_dir="/root/harden-optimai-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$backup_dir"
+
+  echo
+  echo "Mode = $([[ $apply -eq 1 ]] && echo APPLY || echo DRY-RUN) | WAN if = $wan_if | ports = ${ports[*]} | backup = $backup_dir"
+  echo
+
+  _hd_run() { if [[ $apply -eq 1 ]]; then echo "  [RUN ] $*"; eval "$@"; else echo "  [SKIP] $*"; fi; }
+
+  echo "### Bước 1 — Xoá container crawl4ai hiện tại ###"
+  local containers=()
+  mapfile -t containers < <(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | grep -i crawl4ai | cut -f1)
+  if [[ ${#containers[@]} -eq 0 ]]; then
+    echo "  (không thấy container crawl4ai nào)"
+  else
+    for n in "${containers[@]}"; do
+      echo "  [!] container: $n"
+      _hd_run "docker rm -f '$n'"
+    done
+  fi
+
+  echo
+  echo "### Bước 2 — Docker mặc định bind 127.0.0.1 (/etc/docker/daemon.json) ###"
+  local dj="/etc/docker/daemon.json"
+  [[ -f "$dj" ]] && cp -a "$dj" "$backup_dir/daemon.json.bak"
+  local new_json=""
+  if command -v python3 >/dev/null 2>&1; then
+    new_json="$(python3 - "$dj" <<'PY'
+import json, sys, os
+p = sys.argv[1]
+d = {}
+if os.path.exists(p) and os.path.getsize(p) > 0:
+    try:
+        d = json.load(open(p))
+    except Exception:
+        d = {}
+d["ip"] = "127.0.0.1"
+print(json.dumps(d, indent=2))
+PY
+)"
+  elif [[ ! -s "$dj" ]]; then
+    new_json=$'{\n  "ip": "127.0.0.1"\n}'
+  else
+    echo "  [!] Không có python3 và $dj đã có nội dung — bỏ qua để tránh ghi đè sai."
+    echo "      Hãy tự thêm thủ công: \"ip\": \"127.0.0.1\" vào $dj"
+  fi
+
+  if [[ -n "$new_json" ]]; then
+    echo "  daemon.json mới sẽ là:"
+    echo "$new_json" | sed 's/^/       /'
+    if [[ $apply -eq 1 ]]; then
+      mkdir -p /etc/docker
+      printf '%s\n' "$new_json" > "$dj"
+      echo "  [RUN ] đã ghi $dj"
+      echo "  [RUN ] restart docker (node sẽ gián đoạn vài giây)..."
+      svc_restart_docker() { systemctl restart docker 2>/dev/null || service docker restart 2>/dev/null; }
+      svc_restart_docker
+    else
+      echo "  [SKIP] sẽ ghi $dj và restart docker"
+    fi
+  fi
+
+  echo
+  echo "### Bước 3 — Chặn cổng crawl4ai từ WAN (chain DOCKER-USER) ###"
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    for p in "${ports[@]}"; do
+      local rule="ipv4 filter DOCKER-USER 0 -i $wan_if -p tcp --dport $p -j DROP"
+      if firewall-cmd --permanent --direct --query-rule $rule >/dev/null 2>&1; then
+        echo "  [ok] luật đã tồn tại cho cổng $p"
+      else
+        _hd_run "firewall-cmd --permanent --direct --add-rule $rule"
+      fi
+    done
+    _hd_run "firewall-cmd --reload"
+  else
+    echo "  firewalld không chạy -> dùng iptables trực tiếp:"
+    for p in "${ports[@]}"; do
+      _hd_run "iptables -I DOCKER-USER -i $wan_if -p tcp --dport $p -j DROP"
+    done
+    echo "  (khuyến nghị cài iptables-persistent / netfilter-persistent để giữ luật qua reboot)"
+  fi
+
+  echo
+  echo "### Bước 4 — Kéo lại image crawl4ai sạch từ upstream ###"
+  _hd_run "docker pull unclecode/crawl4ai:0.7.8"
+
+  echo
+  echo "### Kiểm tra tàn dư nghi vấn trên host ###"
+  grep -rIlE 'defunct-kernel|SEED PRNG|base64 -d ?\| ?(ba)?sh' /var/spool/cron /etc/cron* 2>/dev/null \
+    | sed 's/^/  [!] cron nghi vấn còn: /'
+  for host_path in /app/.kworker /tmp/python3.12 /tmp/.cfg; do
+    [[ -e "$host_path" ]] && echo "  [!] còn trên host: $host_path (cần xử lý riêng)"
+  done
+  echo "  (nếu không có dòng [!] nào ở trên thì host sạch)"
+
+  echo
+  echo "=== XONG ($([[ $apply -eq 1 ]] && echo 'ĐÃ THỰC THI' || echo 'DRY-RUN — chọn 2 để apply thật')) ==="
+  if [[ $apply -eq 1 ]]; then
+    local vps_ip
+    vps_ip="$(curl -s -m3 ifconfig.me 2>/dev/null || echo 'VPS_IP')"
+    echo
+    echo "Kiểm tra lại sau khi cài node xong:"
+    echo "  docker ps --format '{{.Names}}  {{.Ports}}' | grep -i crawl4ai"
+    echo "    -> phải thấy 127.0.0.1:11235->...  (KHÔNG được là 0.0.0.0)"
+    echo "  curl -s -m3 http://${vps_ip}:11235/ ; echo   # từ MÁY KHÁC: phải timeout/refused"
+    echo "  curl -s -m3 http://127.0.0.1:11235/     ; echo   # từ VPS: phải có phản hồi"
+  fi
+  echo
+}
+
+# ============================================================
 # FIRST INSTALL
 # ============================================================
 
@@ -1470,7 +1627,6 @@ apply_credentials_args_if_provided
 load_telegram_config
 
 while true; do
-  echo "OptimAI CLI All in One - Tuangg - Version 1.1.30"
   echo "1)  Cài đặt node lần đầu (tự động watchdog + Telegram)"
   echo "2)  Xem log node (tmux attach)"
   echo "3)  Cập nhật node"
@@ -1483,9 +1639,10 @@ while true; do
   echo "10) Reinstall optimai-cli"
   echo "11) Re-login node (thủ công)"
   echo "12) Lưu/cập nhật credentials"
+  echo "13) Harden Docker (chống hack container crawl4ai)"
   echo "0)  Thoát"
   echo
-  read -r -p "Chọn [0-12]: " choice
+  read -r -p "Chọn [0-13]: " choice
 
   case "$choice" in
     1)  install_first_time ;;
@@ -1500,10 +1657,11 @@ while true; do
     10) reinstall_cli ;;
     11) relogin_node ;;
     12) configure_credentials ;;
+    13) harden_docker_crawl4ai ;;
     0)
       echo
       echo "============================================================"
-      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v1.1.30) !"
+      echo "🚀 Cảm ơn bạn đã sử dụng Script Tối ưu OptimAI (v${SCRIPT_VERSION}) !"
       echo "✨ Các thay đổi mới nhất:"
       echo "   - Watchdog Zero Downtime (Tail PID event-driven)"
       echo "   - Fix lỗi tương thích OS Repo cho Debian/Devuan"
